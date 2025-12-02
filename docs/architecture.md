@@ -631,7 +631,7 @@ Implement:
 - **ROC AUC**: Area under the ROC curve.
 - **PAUC**: Partial AUC measured over FNR ∈ [0, 0.2] (false negative rate range), normalized to [0, 1]. This focuses on the high-recall region where missing true positives (bad loans) is costly.
 - **Brier score**: Mean squared error of probability predictions.
-- **ABR** (Average Bad Rate): Average true default rate among accepted applicants.
+- **ABR** (Average Bad Rate): Average true default rate among accepted applicants, integrated over acceptance range 20-40% (paper Section 6.3: "we integrate the ABR over acceptance between 20% and 40%, which reflects historical policies at Monedo").
 - Other business metrics as required (e.g., profit).
 
 Interface:
@@ -641,6 +641,7 @@ def compute_metrics(
     y_true: np.ndarray,
     y_score: np.ndarray,
     metrics: list[str],
+    abr_range: Tuple[float, float] = (0.2, 0.4),  # Paper Section 6.3
 ) -> dict[str, float]:
     ...
 ```
@@ -668,35 +669,70 @@ The Bayesian evaluation uses:
 
 It produces posterior distributions for metrics like AUC, Brier, ABR, and profit.
 
-### 9.1 Interface
+### 9.1 Paper's Two Separate Processes
+
+**IMPORTANT:** The paper describes two distinct iterative processes that are NOT connected:
+
+1. **Acceptance Loop (500 iterations)** - Simulates the lending process
+   - Each iteration: generate applicants → score → accept/reject → reveal labels for accepts
+   - Purpose: Creates selection-biased datasets (D_a, D_r) over time
+   - This simulates how a lender accumulates data in production
+
+2. **Bayesian MC Sampling (100-10,000 iterations)** - Estimates metrics
+   - Algorithm 1 runs MC iterations until metric convergence (ε=10⁻⁶)
+   - Purpose: Estimate performance metrics on the full population
+   - Convergence parameters (Table E.9): j_min=10², j_max=10⁶, ε=10⁻⁶
+
+These processes serve different purposes:
+- Acceptance loop → Generates biased data (simulates real-world lending)
+- Bayesian MC → Evaluates model performance on that biased data
+
+### 9.2 Implementation
+
+At each evaluation checkpoint during the acceptance loop, we call `bayesian_evaluate()`
+which runs its own internal MC loop with convergence checking:
 
 ```python
-@dataclass
-class BayesianEvalConfig:
-    n_samples: int
-    n_score_bands: int  # K: number of score bands for stratified posterior sampling
-    prior_type: str
-    prior_params: dict[str, float]  # e.g., {"alpha": 1.0, "beta": 1.0}
-    metrics: list[str]
-    seed: int
+# At each checkpoint (e.g., iteration 10, 20, 30, ...)
+bayesian_result = bayesian_evaluate(
+    y_accepts, scores_accepts, scores_rejects,
+    cfg=BayesianEvalConfig(j_min=100, j_max=1000, epsilon=1e-6),
+)
+# Returns: {"auc": {"mean": ..., "std": ..., "q2.5": ..., "q97.5": ...}, ...}
+```
 
+Configuration via `configs/bayesian_eval.yaml`:
+- `j_max`: Maximum MC samples (default: 1000, paper: 10⁶)
+- `j_min`: Minimum samples before convergence check (default: 100)
+- `epsilon`: Convergence threshold (default: 10⁻⁶)
+- `abr_range`: ABR integration range (default: [0.2, 0.4], paper Section 6.3)
+
+### 9.3 Interface
+
+```python
 def bayesian_evaluate(
     y_accepts: np.ndarray,
     scores_accepts: np.ndarray,
     scores_rejects: np.ndarray,
-    cfg: BayesianEvalConfig,
+    cfg: BayesianEvalConfig,  # Includes abr_range for ABR integration
+    metrics_list: list[str] | None = None,
 ) -> dict[str, Any]:
-    ...
+    """Bayesian evaluation with MC convergence (Algorithm 1).
+
+    Returns posterior statistics for each metric:
+    {"auc": {"mean": ..., "std": ..., "q2.5": ..., "q97.5": ...}, ...}
+    """
 ```
 
-### 9.2 Algorithm (Paper Algorithm 1)
+### 9.4 Algorithm (Paper Algorithm 1 - Original)
 
 **Input:**
 - `y_a`: True labels for accepts.
 - `s_a`: Scores for accepts.
 - `s_r`: Scores for rejects.
-- `N`: Number of Monte Carlo samples.
+- `N`: Number of Monte Carlo samples (j_min=100, j_max=10⁶).
 - Prior parameters (α, β for Beta distribution).
+- Convergence threshold ε=10⁻⁶.
 
 **Procedure:**
 
@@ -722,6 +758,9 @@ def bayesian_evaluate(
       - AUC, PAUC, Brier, ABR, etc.
 
    e. **Store metrics** for sample i.
+
+   f. **Check convergence** (if i >= j_min):
+      - If running mean has converged (change < ε), stop early.
 
 4. **Aggregate** across samples to get posterior statistics (mean, median, credible intervals).
 
@@ -770,95 +809,58 @@ The results can be easily plotted in notebooks.
 
 ### 11.1 Main Experiment Script
 
-`scripts/run_experiment.py`:
+`scripts/run_experiment.py` runs the full experiment with iteration tracking:
 
 ```python
-def main(config_path: str):
-    cfg = load_experiment_config(config_path)
+def run_trial(seed, data_cfg, model_cfg, loop_cfg, basl_cfg, track_every):
+    """Run a single trial with iteration tracking."""
+    # Generate holdout once for both loops (fair comparison)
+    generator_holdout = SyntheticGenerator(data_cfg)
+    holdout = generator_holdout.generate_holdout()
 
-    # 1. Data source
-    if cfg.data.source == "synthetic":
-        generator = SyntheticGenerator(cfg.data.synthetic)
-        model_for_sim = build_model_from_config(cfg.model)
-        loop = AcceptanceLoop(generator, model_for_sim, cfg.simulation.acceptance_loop)
-        D_a, D_r, H = loop.run()
-    else:
-        loader = RealDataLoader(cfg.data.real)
-        D_a = loader.load_accepts()
-        D_r = loader.load_rejects()
-        H = loader.load_holdout()
+    # Baseline loop (no BASL)
+    generator_base = SyntheticGenerator(data_cfg)
+    loop_base = AcceptanceLoop(generator_base, model_cfg, loop_cfg, basl_cfg=None)
+    D_a_base, D_r_base, _, baseline_model, baseline_history = loop_base.run(
+        holdout=holdout, track_every=track_every
+    )
 
-    # 2. Preprocessing
-    feature_pipeline = FeaturePipeline(...)
-    X_a = feature_pipeline.fit_transform(D_a.drop(columns=["y"]))
-    y_a = D_a["y"].to_numpy()
-    X_r = feature_pipeline.transform(D_r)
+    # BASL loop
+    generator_basl = SyntheticGenerator(data_cfg)
+    loop_basl = AcceptanceLoop(generator_basl, model_cfg, loop_cfg, basl_cfg=basl_cfg)
+    D_a_basl, D_r_basl, _, basl_model, basl_history = loop_basl.run(
+        holdout=holdout, track_every=track_every
+    )
 
-    X_H = None
-    y_H = None
-    if H is not None:
-        X_H = feature_pipeline.transform(H.drop(columns=["y"]))
-        y_H = H["y"].to_numpy()
+    return {
+        "seed": seed,
+        "baseline_history": baseline_history,  # List of {iteration, oracle, accepts, bayesian}
+        "basl_history": basl_history,
+    }
 
-    # 3. Baseline model
-    baseline_model = build_model_from_config(cfg.model)
-    baseline_model.fit(X_a, y_a)
+def main():
+    # Load configs from YAML
+    data_cfg = SyntheticDataConfig.from_yaml()
+    model_cfg = XGBoostConfig.from_yaml()
+    loop_cfg = AcceptanceLoopConfig.from_yaml()
+    basl_cfg = BASLConfig.from_yaml()
+    exp_cfg = ExperimentConfig.from_yaml()
 
-    # 4. BASL
-    basl_model = None
-    augmented_data = None
-    if cfg.basl.enabled:
-        basl_trainer = BASLTrainer(
-            base_model_factory=lambda: build_model_from_config(cfg.model),
-            weak_learner_factory=lambda: LogisticRegressionModel(penalty="l1"),
-            cfg=cfg.basl,
-            feature_pipeline=feature_pipeline,
-        )
-        basl_model, augmented_data = basl_trainer.run_basl(D_a, D_r)
+    # Run trials (100 seeds as in paper Section 7.1.1)
+    trials = []
+    for seed in range(exp_cfg.n_seeds):
+        trial = run_trial(seed, data_cfg, model_cfg, loop_cfg, basl_cfg, exp_cfg.track_every)
+        trials.append(trial)
 
-    # 5. Evaluation
-    results = {}
-
-    if cfg.evaluation.bayesian.enabled:
-        scores_a = baseline_model.predict_proba(X_a)
-        scores_r = baseline_model.predict_proba(X_r)
-        bayes_res = bayesian_evaluate(
-            y_accepts=y_a,
-            scores_accepts=scores_a,
-            scores_rejects=scores_r,
-            cfg=cfg.evaluation.bayesian,
-        )
-        results["bayesian_baseline"] = bayes_res
-
-        if basl_model is not None:
-            scores_a_basl = basl_model.predict_proba(X_a)
-            scores_r_basl = basl_model.predict_proba(X_r)
-            bayes_res_basl = bayesian_evaluate(
-                y_accepts=y_a,
-                scores_accepts=scores_a_basl,
-                scores_rejects=scores_r_basl,
-                cfg=cfg.evaluation.bayesian,
-            )
-            results["bayesian_basl"] = bayes_res_basl
-
-    if H is not None:
-        scores_H_base = baseline_model.predict_proba(X_H)
-        results["oracle_baseline"] = compute_metrics(y_H, scores_H_base, cfg.evaluation.metrics)
-
-        if basl_model is not None:
-            scores_H_basl = basl_model.predict_proba(X_H)
-            results["oracle_basl"] = compute_metrics(y_H, scores_H_basl, cfg.evaluation.metrics)
-
-    save_results(results, output_dir=cfg.output_dir)
+    # Aggregate histories across trials
+    aggregated = aggregate_histories(trials)
+    # Save results...
 ```
 
-### 11.2 Specialized Runners
-
-Additional entry points can be added:
-
-- `train_baseline.py` – train and save a model.
-- `run_basl.py` – only run BASL on pre-split data.
-- `run_bayesian_eval.py` – run Bayesian evaluation on an existing model and dataset.
+Each trial returns per-iteration metrics for three evaluation types:
+- **Oracle**: True metrics on external holdout
+- **Accepts**: Biased metrics on accepts only
+- **Bayesian**: Metrics with coin flip pseudo-labeling
 
 ---
 

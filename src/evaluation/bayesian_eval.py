@@ -1,33 +1,27 @@
 """
-Bayesian evaluation framework for credit scoring under sampling bias.
+Bayesian evaluation via stochastic pseudo-labeling.
 
-Uses Monte Carlo sampling to estimate posterior distributions of metrics
-by pseudo-labeling rejects based on score-band specific bad rates.
+Implements the paper's Algorithm 1: Bayesian Evaluation Framework.
+Uses Monte Carlo sampling with convergence checking to estimate
+performance metrics on the full population (accepts + rejects).
 
-Algorithm based on paper Algorithm 1.
+Key parameters from Table E.9:
+- j_min = 100 (minimum MC samples before convergence check)
+- j_max = 10^6 (maximum MC samples)
+- ε = 10^-6 (convergence threshold)
+- K = 10 (number of score bands)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
 from src.evaluation.metrics import compute_metrics
 
-
-@dataclass
-class BayesianEvalConfig:
-    """Configuration for Bayesian evaluation."""
-
-    n_samples: int = 5000  # Number of Monte Carlo samples
-    n_score_bands: int = 10  # K: number of score bands for stratified sampling
-    prior_alpha: float = 1.0  # Beta prior alpha (uninformative)
-    prior_beta: float = 1.0  # Beta prior beta (uninformative)
-    metrics: List[str] = field(default_factory=lambda: ["auc", "pauc", "brier", "abr"])
-    accept_rate: float = 0.15  # For ABR calculation
-    random_seed: int = 42
+if TYPE_CHECKING:
+    from src.config import BayesianEvalConfig
 
 
 def _assign_score_bands(
@@ -43,14 +37,49 @@ def _assign_score_bands(
     Returns:
         Array of band assignments (0 to n_bands-1).
     """
-    # Compute band boundaries as percentiles
     percentiles = np.linspace(0, 100, n_bands + 1)
     boundaries = np.percentile(scores, percentiles)
-
-    # Assign each score to a band
     bands = np.digitize(scores, boundaries[1:-1])  # 0 to n_bands-1
-
     return bands
+
+
+def _pseudo_label_rejects_once(
+    y_accepts: np.ndarray,
+    bands_accepts: np.ndarray,
+    bands_rejects: np.ndarray,
+    n_bands: int,
+    prior_alpha: float,
+    prior_beta: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Single MC iteration: pseudo-label rejects via coin flip.
+
+    For each score band:
+    1. Compute bad rate from accepts in that band
+    2. Sample bad rate from Beta posterior
+    3. Coin flip each reject using sampled bad rate
+    """
+    n_rejects = len(bands_rejects)
+    y_rejects_pseudo = np.zeros(n_rejects, dtype=int)
+
+    for k in range(n_bands):
+        # Compute bad rate in this band from accepts
+        mask_a = bands_accepts == k
+        n_a_k = mask_a.sum()
+        d_a_k = y_accepts[mask_a].sum() if n_a_k > 0 else 0
+
+        # Sample bad rate from Beta posterior
+        post_alpha = prior_alpha + d_a_k
+        post_beta = prior_beta + n_a_k - d_a_k
+        p_k = rng.beta(post_alpha, post_beta)
+
+        # Coin flip for rejects in this band
+        mask_r = bands_rejects == k
+        n_r_k = mask_r.sum()
+        if n_r_k > 0:
+            y_rejects_pseudo[mask_r] = rng.binomial(1, p_k, n_r_k)
+
+    return y_rejects_pseudo
 
 
 def bayesian_evaluate(
@@ -58,115 +87,156 @@ def bayesian_evaluate(
     scores_accepts: np.ndarray,
     scores_rejects: np.ndarray,
     cfg: BayesianEvalConfig,
-) -> Dict[str, Any]:
-    """Run Bayesian evaluation using Monte Carlo sampling.
+    metrics_list: list[str] | None = None,
+) -> dict[str, Any]:
+    """Bayesian evaluation with MC convergence (Algorithm 1).
 
-    For each MC sample:
-    1. Sample band-specific bad rates from Beta posterior
-    2. Pseudo-label rejects by sampling from Bernoulli(p_k)
-    3. Combine accepts + pseudo-labeled rejects
-    4. Compute metrics on combined data
+    Runs Monte Carlo iterations to estimate performance metrics on the full
+    population. Each iteration pseudo-labels rejects using band-specific
+    bad rates sampled from Beta posteriors.
+
+    Convergence: Stops when running mean changes by less than epsilon,
+    or when j_max iterations are reached.
 
     Args:
         y_accepts: True labels for accepts (0=good, 1=bad).
         scores_accepts: Predicted scores for accepts.
-        scores_rejects: Predicted scores for rejects (no labels).
-        cfg: Bayesian evaluation configuration.
+        scores_rejects: Predicted scores for rejects.
+        cfg: Bayesian evaluation configuration (includes abr_range).
+        metrics_list: Metrics to compute. Default: ["auc", "pauc", "brier", "abr"].
 
     Returns:
         Dictionary with posterior statistics for each metric:
         {
-            "metrics": {
-                "auc": {"mean": ..., "median": ..., "q2.5": ..., "q97.5": ...},
-                ...
-            },
-            "n_samples": ...,
-            "n_accepts": ...,
-            "n_rejects": ...,
+            "auc": {"mean": ..., "std": ..., "q2.5": ..., "q97.5": ...},
+            "pauc": {...},
+            ...
+            "n_samples": <number of MC samples used>,
+            "converged": <whether convergence was achieved>,
         }
     """
-    rng = np.random.default_rng(cfg.random_seed)
+    if metrics_list is None:
+        metrics_list = ["auc", "pauc", "brier", "abr"]
 
+    rng = np.random.default_rng(cfg.random_seed)
     n_accepts = len(y_accepts)
     n_rejects = len(scores_rejects)
 
-    # Combine scores for band assignment
-    all_scores = np.concatenate([scores_accepts, scores_rejects])
-    all_bands = _assign_score_bands(all_scores, cfg.n_score_bands)
+    # Handle edge case: no rejects
+    if n_rejects == 0:
+        base_metrics = compute_metrics(y_accepts, scores_accepts, metrics_list, cfg.abr_range)
+        return {
+            metric: {"mean": val, "std": 0.0, "q2.5": val, "q97.5": val}
+            for metric, val in base_metrics.items()
+        } | {"n_samples": 1, "converged": True}
 
+    # Precompute band assignments (shared across all MC iterations)
+    all_scores = np.concatenate([scores_accepts, scores_rejects])
+    all_bands = _assign_score_bands(all_scores, cfg.n_bands)
     bands_accepts = all_bands[:n_accepts]
     bands_rejects = all_bands[n_accepts:]
 
-    # Compute observed bad counts per band (from accepts only)
-    band_stats = []
-    for k in range(cfg.n_score_bands):
-        mask_a = bands_accepts == k
-        n_a_k = mask_a.sum()
-        d_a_k = y_accepts[mask_a].sum() if n_a_k > 0 else 0
+    # Storage for MC samples
+    metric_samples: dict[str, list[float]] = {m: [] for m in metrics_list}
+    running_means: dict[str, float] = {m: 0.0 for m in metrics_list}
 
-        mask_r = bands_rejects == k
-        n_r_k = mask_r.sum()
+    converged = False
+    n_samples = 0
 
-        band_stats.append({
-            "n_accepts": int(n_a_k),
-            "n_bads_accepts": int(d_a_k),
-            "n_rejects": int(n_r_k),
-        })
-
-    # Monte Carlo sampling
-    metric_samples = {m: [] for m in cfg.metrics}
-
-    for _ in range(cfg.n_samples):
-        # Sample pseudo-labels for rejects
-        y_rejects_sampled = np.zeros(n_rejects, dtype=int)
-
-        for k in range(cfg.n_score_bands):
-            stats = band_stats[k]
-
-            # Sample bad rate from Beta posterior
-            # Posterior: Beta(alpha + d_a_k, beta + n_a_k - d_a_k)
-            post_alpha = cfg.prior_alpha + stats["n_bads_accepts"]
-            post_beta = cfg.prior_beta + stats["n_accepts"] - stats["n_bads_accepts"]
-            p_k = rng.beta(post_alpha, post_beta)
-
-            # Pseudo-label rejects in this band
-            mask_r = bands_rejects == k
-            n_r_k = mask_r.sum()
-            if n_r_k > 0:
-                y_rejects_sampled[mask_r] = rng.binomial(1, p_k, n_r_k)
-
-        # Combine accepts and pseudo-labeled rejects
-        y_combined = np.concatenate([y_accepts, y_rejects_sampled])
-        scores_combined = np.concatenate([scores_accepts, scores_rejects])
-
-        # Compute metrics on combined data
-        sample_metrics = compute_metrics(
-            y_combined,
-            scores_combined,
-            cfg.metrics,
-            accept_rate=cfg.accept_rate,
+    for j in range(1, cfg.j_max + 1):
+        # Pseudo-label rejects for this MC iteration
+        y_rejects_pseudo = _pseudo_label_rejects_once(
+            y_accepts, bands_accepts, bands_rejects,
+            cfg.n_bands, cfg.prior_alpha, cfg.prior_beta, rng
         )
 
-        for m in cfg.metrics:
-            metric_samples[m].append(sample_metrics[m])
+        # Combine accepts and pseudo-labeled rejects
+        y_combined = np.concatenate([y_accepts, y_rejects_pseudo])
+        scores_combined = all_scores
 
-    # Aggregate results
-    results = {
-        "metrics": {},
-        "n_samples": cfg.n_samples,
-        "n_accepts": n_accepts,
-        "n_rejects": n_rejects,
-        "band_stats": band_stats,
-    }
+        # Compute metrics for this MC sample
+        sample_metrics = compute_metrics(y_combined, scores_combined, metrics_list, cfg.abr_range)
 
-    for m in cfg.metrics:
-        samples = np.array(metric_samples[m])
-        results["metrics"][m] = {
+        # Store samples and update running means
+        prev_means = running_means.copy()
+        for metric in metrics_list:
+            metric_samples[metric].append(sample_metrics[metric])
+            # Incremental mean update
+            running_means[metric] = running_means[metric] + (
+                sample_metrics[metric] - running_means[metric]
+            ) / j
+
+        n_samples = j
+
+        # Check convergence after j_min iterations
+        if j >= cfg.j_min:
+            max_change = max(
+                abs(running_means[m] - prev_means[m]) for m in metrics_list
+            )
+            if max_change < cfg.epsilon:
+                converged = True
+                break
+
+    # Compute posterior statistics
+    result: dict[str, Any] = {}
+    for metric in metrics_list:
+        samples = np.array(metric_samples[metric])
+        result[metric] = {
             "mean": float(np.mean(samples)),
-            "median": float(np.median(samples)),
             "std": float(np.std(samples)),
             "q2.5": float(np.percentile(samples, 2.5)),
             "q97.5": float(np.percentile(samples, 97.5)),
         }
 
-    return results
+    result["n_samples"] = n_samples
+    result["converged"] = converged
+
+    return result
+
+
+def pseudo_label_rejects_stochastic(
+    y_accepts: np.ndarray,
+    scores_accepts: np.ndarray,
+    scores_rejects: np.ndarray,
+    n_bands: int = 10,
+    prior_alpha: float = 1.0,
+    prior_beta: float = 1.0,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Single stochastic pseudo-labeling of rejects (simplified version).
+
+    This is the simplified version that does one coin flip per call.
+    For proper Bayesian evaluation, use bayesian_evaluate() with MC sampling.
+
+    Args:
+        y_accepts: True labels for accepts (0=good, 1=bad).
+        scores_accepts: Predicted scores for accepts.
+        scores_rejects: Predicted scores for rejects (no labels).
+        n_bands: Number of score bands for stratification.
+        prior_alpha: Beta prior alpha (uninformative default).
+        prior_beta: Beta prior beta (uninformative default).
+        rng: Random number generator. If None, creates one.
+
+    Returns:
+        Pseudo-labels for rejects (shape: n_rejects).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_accepts = len(y_accepts)
+    n_rejects = len(scores_rejects)
+
+    if n_rejects == 0:
+        return np.array([], dtype=int)
+
+    # Combine scores for band assignment
+    all_scores = np.concatenate([scores_accepts, scores_rejects])
+    all_bands = _assign_score_bands(all_scores, n_bands)
+
+    bands_accepts = all_bands[:n_accepts]
+    bands_rejects = all_bands[n_accepts:]
+
+    return _pseudo_label_rejects_once(
+        y_accepts, bands_accepts, bands_rejects,
+        n_bands, prior_alpha, prior_beta, rng
+    )

@@ -10,7 +10,7 @@ Implements:
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 from sklearn.metrics import brier_score_loss, roc_auc_score, roc_curve
@@ -94,37 +94,56 @@ def compute_brier(y_true: np.ndarray, y_score: np.ndarray) -> float:
 def compute_abr(
     y_true: np.ndarray,
     y_score: np.ndarray,
-    accept_rate: float = 0.15,
+    accept_rate_min: float = 0.2,
+    accept_rate_max: float = 0.4,
+    n_points: int = 21,
 ) -> float:
-    """Compute Average Bad Rate among accepted applicants.
+    """Compute Average Bad Rate integrated over acceptance range.
 
-    Simulates accepting the top α fraction (lowest scores) and computes
-    the actual bad rate among those accepted.
+    Per paper Section 6.3: "Specifically, we integrate the ABR over acceptance
+    between 20% and 40%, which reflects historical policies at Monedo."
+
+    Computes bad rate at multiple acceptance thresholds and integrates
+    using trapezoidal rule.
 
     Lower ABR is better (fewer defaults among accepted applicants).
 
     Args:
         y_true: True binary labels (0=good, 1=bad).
         y_score: Predicted probability of bad (y=1).
-        accept_rate: Fraction to accept (α). Default 0.15.
+        accept_rate_min: Minimum acceptance rate for integration (default 0.2).
+        accept_rate_max: Maximum acceptance rate for integration (default 0.4).
+        n_points: Number of points for numerical integration (default 21).
 
     Returns:
-        Bad rate among accepted applicants.
+        Integrated bad rate over acceptance range, normalized by range width.
     """
-    n_accept = max(1, int(len(y_true) * accept_rate))
+    # Sort by score to efficiently compute bad rates at different thresholds
+    sorted_indices = np.argsort(y_score)
+    y_sorted = y_true[sorted_indices]
+    n = len(y_true)
 
-    # Accept applicants with lowest predicted PD
-    accept_indices = np.argsort(y_score)[:n_accept]
-    y_accepted = y_true[accept_indices]
+    # Compute bad rate at each acceptance threshold
+    accept_rates = np.linspace(accept_rate_min, accept_rate_max, n_points)
+    bad_rates = []
 
-    return float(y_accepted.mean())
+    for rate in accept_rates:
+        n_accept = max(1, int(n * rate))
+        bad_rate = y_sorted[:n_accept].mean()
+        bad_rates.append(bad_rate)
+
+    # Integrate using trapezoidal rule and normalize by range width
+    integrated = np.trapz(bad_rates, accept_rates)
+    normalized = integrated / (accept_rate_max - accept_rate_min)
+
+    return float(normalized)
 
 
 def compute_metrics(
     y_true: np.ndarray,
     y_score: np.ndarray,
     metrics: List[str],
-    accept_rate: float = 0.15,
+    abr_range: Tuple[float, float] = (0.2, 0.4),
 ) -> Dict[str, float]:
     """Compute multiple evaluation metrics.
 
@@ -133,7 +152,8 @@ def compute_metrics(
         y_score: Predicted probability of bad (y=1).
         metrics: List of metric names to compute.
             Supported: "auc", "pauc", "brier", "abr".
-        accept_rate: Acceptance rate for ABR calculation.
+        abr_range: (min, max) acceptance rate range for ABR integration.
+            Per paper Section 6.3, default is (0.2, 0.4).
 
     Returns:
         Dictionary mapping metric name to value.
@@ -144,7 +164,7 @@ def compute_metrics(
         "auc": lambda: compute_auc(y_true, y_score),
         "pauc": lambda: compute_pauc(y_true, y_score),
         "brier": lambda: compute_brier(y_true, y_score),
-        "abr": lambda: compute_abr(y_true, y_score, accept_rate),
+        "abr": lambda: compute_abr(y_true, y_score, abr_range[0], abr_range[1]),
     }
 
     for metric in metrics:

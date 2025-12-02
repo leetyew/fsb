@@ -1,49 +1,39 @@
 """
-Acceptance loop simulation for creating selection-biased datasets.
+Acceptance loop simulation with integrated training and evaluation.
 
-Simulates lender behavior over multiple periods where applicants are
-accepted/rejected based on model scores, creating D_a (accepts with labels),
-D_r (rejects without labels), and H (unbiased holdout).
-
-Key paper reference: Appendix C.1, page A8 describes x_v-based initial
-acceptance before any model exists.
-
-Supports two modes (for paper replication):
-- Baseline mode: Retrain on D_a only each iteration (default)
-- BASL mode: Apply BASL each iteration, retrain on augmented data (page A9)
+Implements the paper's approach where:
+- Training side: Weak learner pseudo-labels rejects (deterministic via BASL)
+- Evaluation side: Monte Carlo pseudo-labeling with convergence (Algorithm 1)
+- Configurable train/holdout split at accepts AND rejects level
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from src.basl.trainer import BASLTrainer
-from src.config import AcceptanceLoopConfig, BASLConfig, XGBoostConfig
+from src.config import AcceptanceLoopConfig, BASLConfig, BayesianEvalConfig, XGBoostConfig
+from src.evaluation.bayesian_eval import bayesian_evaluate
+from src.evaluation.metrics import compute_metrics
 from src.io.synthetic_generator import SyntheticGenerator
 from src.models.xgboost_model import XGBoostModel
 
-if TYPE_CHECKING:
-    from src.evaluation.bayesian_eval import BayesianEvalConfig
-
 
 class AcceptanceLoop:
-    """Simulates lender acceptance decisions over multiple periods.
+    """Integrated training and evaluation loop for paper replication.
 
-    Creates selection bias by accepting only top α percentile of applicants
-    by model score (PD). Labels are only observed for accepted applicants.
+    Supports two training modes:
+    1. Baseline (basl_cfg=None): Train only on accepts
+    2. BASL (basl_cfg provided): Train on accepts + pseudo-labeled rejects
 
-    The initial acceptance (before any model) uses x_v - the feature with
-    the largest mean difference between good and bad applicants - as a
-    rule-based ranking proxy.
-
-    Modes:
-    - Baseline (basl_cfg=None): Retrain on D_a only each iteration
-    - BASL (basl_cfg provided): Apply BASL to augment D_a with pseudo-labeled
-      rejects, then retrain on augmented data (per paper page A9)
+    Tracks three evaluation types per iteration for Figure 2:
+    - Oracle: Metrics on external holdout with true labels
+    - Accepts: Metrics on accepts only (biased)
+    - Bayesian: Metrics using MC pseudo-labeling (Algorithm 1)
     """
 
     def __init__(
@@ -52,185 +42,286 @@ class AcceptanceLoop:
         model_cfg: XGBoostConfig,
         cfg: AcceptanceLoopConfig,
         basl_cfg: Optional[BASLConfig] = None,
+        bayesian_cfg: Optional[BayesianEvalConfig] = None,
     ) -> None:
         self.generator = generator
         self.model_cfg = model_cfg
         self.cfg = cfg
         self.basl_cfg = basl_cfg
+        self.bayesian_cfg = bayesian_cfg or BayesianEvalConfig()
         self.rng = np.random.default_rng(cfg.random_seed)
 
-        # Initialize BASL trainer if config provided
-        self.basl_trainer = BASLTrainer(basl_cfg) if basl_cfg else None
+        # BASL trainer only if config provided
+        self.basl_trainer = BASLTrainer(basl_cfg) if basl_cfg is not None else None
 
     def _accept_by_feature(
         self, df: pd.DataFrame, feature: str, accept_rate: float
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Accept top α percentile by feature value (lower = lower risk).
-
-        Args:
-            df: Applicant DataFrame with features and 'y'.
-            feature: Feature name to rank by.
-            accept_rate: Fraction to accept (α).
-
-        Returns:
-            (accepts_df, rejects_df) tuple.
-        """
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Accept top α percentile by feature value (lower = lower risk)."""
         threshold = np.percentile(df[feature], accept_rate * 100)
         accept_mask = df[feature] <= threshold
         return df[accept_mask].copy(), df[~accept_mask].copy()
 
-    def _accept_by_score(
-        self, df: pd.DataFrame, model: XGBoostModel, accept_rate: float
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Accept top α percentile by model score (lower PD = lower risk).
+    def _split_train_holdout(
+        self, df: pd.DataFrame, train_ratio: float
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Split dataframe into train and holdout sets."""
+        n = len(df)
+        n_train = int(n * train_ratio)
+        indices = self.rng.permutation(n)
+        train_indices = indices[:n_train]
+        holdout_indices = indices[n_train:]
+        return df.iloc[train_indices].copy(), df.iloc[holdout_indices].copy()
 
-        Args:
-            df: Applicant DataFrame with features and 'y'.
-            model: Trained model to score applicants.
-            accept_rate: Fraction to accept (α).
+    def _check_early_stopping(
+        self,
+        current_metric: float,
+        best_metric: Optional[float],
+        patience_counter: int,
+        metric_name: str,
+    ) -> Tuple[bool, Optional[float], int]:
+        """Check if early stopping should trigger.
 
         Returns:
-            (accepts_df, rejects_df) tuple.
+            (should_stop, new_best_metric, new_patience_counter)
         """
-        feature_cols = [c for c in df.columns if c != "y"]
-        X = df[feature_cols].values
-        scores = model.predict_proba(X)
+        es_cfg = self.cfg.early_stopping
 
-        threshold = np.percentile(scores, accept_rate * 100)
-        accept_mask = scores <= threshold
-        return df[accept_mask].copy(), df[~accept_mask].copy()
+        # Higher is better for AUC/PAUC, lower is better for Brier/ABR
+        higher_is_better = metric_name in ["auc", "pauc"]
+
+        if best_metric is None:
+            return False, current_metric, 0
+
+        if higher_is_better:
+            improved = current_metric > best_metric + es_cfg.min_delta
+        else:
+            improved = current_metric < best_metric - es_cfg.min_delta
+
+        if improved:
+            return False, current_metric, 0
+        else:
+            new_counter = patience_counter + 1
+            should_stop = new_counter >= es_cfg.patience
+            return should_stop, best_metric, new_counter
 
     def run(
         self,
-        return_model: bool = False,
-        holdout: Optional[pd.DataFrame] = None,
-        eval_cfg: Optional["BayesianEvalConfig"] = None,
-        track_every: int = 10,
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | tuple[
-        pd.DataFrame, pd.DataFrame, pd.DataFrame, XGBoostModel
-    ] | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, XGBoostModel, list[dict]]:
-        """Run the acceptance loop simulation with optional metric tracking.
+        holdout: pd.DataFrame,
+        track_every: int = 1,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, XGBoostModel, List[Dict[str, Any]]]:
+        """Run the integrated training and evaluation loop.
 
         Args:
-            return_model: If True, return the final trained model.
-            holdout: Pre-generated holdout for tracking. If None, generates new one.
-            eval_cfg: Bayesian eval config. If provided with holdout, enables tracking.
-            track_every: Compute metrics every N iterations (default 10).
+            holdout: External holdout for oracle evaluation.
+            track_every: Track metrics every N iterations.
 
         Returns:
-            Without tracking: (D_a, D_r, H) or (D_a, D_r, H, model)
-            With tracking: (D_a, D_r, H, model, history) where history is:
-                [{'iteration': int, 'oracle': {...}, 'accepts': {...}, 'bayesian': {...}}]
+            (D_a, D_r, holdout, model, metrics_history)
+            where metrics_history contains oracle/accepts/bayesian metrics per iteration
         """
         feature_cols = [f"x{i}" for i in range(self.generator.cfg.n_features)]
         alpha = self.cfg.target_accept_rate
+        train_ratio = self.cfg.train_holdout_split
+        es_cfg = self.cfg.early_stopping
 
-        # Determine if tracking is enabled
-        tracking_enabled = holdout is not None and eval_cfg is not None
-
-        if tracking_enabled:
-            from src.evaluation.bayesian_eval import bayesian_evaluate
-            from src.evaluation.metrics import compute_metrics
-
-            metrics = eval_cfg.metrics
-            X_H = holdout[feature_cols].values
-            y_H = holdout["y"].values
-            H = holdout
-        else:
-            H = None  # Will generate later
-
-        # Step 1: Generate initial batch
-        initial_batch = self.generator.generate_population(self.cfg.initial_batch_size)
-
-        # Step 2: Initial acceptance using x_v (no model yet)
-        D_a, initial_rejects = self._accept_by_feature(
-            initial_batch, self.cfg.x_v_feature, alpha
+        # Step 1: Generate initial population
+        total_applicants = self.cfg.initial_batch_size + (
+            self.cfg.batch_size * self.cfg.n_periods
         )
-        D_r = initial_rejects[feature_cols].copy()  # No labels for rejects
+        population = self.generator.generate_population(total_applicants)
 
-        # Step 3: Train initial model on D_a
+        # Step 2: Initial acceptance using x_v (simulates initial lending decision)
+        accepts_df, rejects_df = self._accept_by_feature(
+            population, self.cfg.x_v_feature, alpha
+        )
+
+        # Step 3: Split at accepts AND rejects level using configured ratio
+        train_accepts, internal_holdout_accepts = self._split_train_holdout(
+            accepts_df, train_ratio
+        )
+        train_rejects, internal_holdout_rejects = self._split_train_holdout(
+            rejects_df, train_ratio
+        )
+
+        # Extract features and labels for training
+        X_train_accepts = train_accepts[feature_cols].values
+        y_train_accepts = train_accepts["y"].values
+        X_train_rejects = train_rejects[feature_cols].values
+
+        # Internal holdout for Bayesian evaluation (coin flip)
+        X_internal_holdout_accepts = internal_holdout_accepts[feature_cols].values
+        y_internal_holdout_accepts = internal_holdout_accepts["y"].values
+        X_internal_holdout_rejects = internal_holdout_rejects[feature_cols].values
+
+        # External holdout for oracle evaluation
+        X_holdout = holdout[feature_cols].values
+        y_holdout = holdout["y"].values
+
+        # Step 4: Filter train_rejects with Isolation Forest (once) - only for BASL mode
+        if self.basl_trainer is not None:
+            X_train_rejects_filtered = self.basl_trainer.filter_rejects_once(
+                X_train_accepts, X_train_rejects
+            )
+        else:
+            X_train_rejects_filtered = X_train_rejects
+
+        # Initialize training state
+        X_labeled = X_train_accepts.copy()
+        y_labeled = y_train_accepts.copy()
+        X_rejects_pool = X_train_rejects_filtered.copy()
+
+        # Track accumulated D_a and D_r as DataFrames for return
+        D_a = train_accepts.copy()
+        D_r = train_rejects.copy()
+
+        # Initialize XGBoost model
         model = XGBoostModel(self.model_cfg)
-        X_a = D_a[feature_cols].values
-        y_a = D_a["y"].values
-        model.fit(X_a, y_a)
+        model.fit(X_labeled, y_labeled)
 
-        # Initialize tracking history
-        history: list[dict] = []
+        # Tracking state
+        metrics_history: List[Dict[str, Any]] = []
+        best_metric: Optional[float] = None
+        patience_counter = 0
 
-        def compute_all_metrics(iteration: int) -> dict:
-            """Compute oracle, accepts-based, and Bayesian metrics."""
-            X_a_curr = D_a[feature_cols].values
-            y_a_curr = D_a["y"].values
-            X_r_curr = D_r.values
+        # Initial evaluation (iteration 0)
+        initial_metrics = self._evaluate(
+            model,
+            X_internal_holdout_accepts, y_internal_holdout_accepts,
+            X_internal_holdout_rejects,
+            X_holdout, y_holdout,
+            0
+        )
+        metrics_history.append(initial_metrics)
+        best_metric = initial_metrics["bayesian"][es_cfg.metric]
 
-            scores_H = model.predict_proba(X_H)
-            scores_a = model.predict_proba(X_a_curr)
-            scores_r = model.predict_proba(X_r_curr) if len(X_r_curr) > 0 else np.array([])
+        # Step 5: Main training loop
+        for iteration in tqdm(range(1, self.cfg.n_periods + 1), desc="Training loop"):
+            # BASL mode: weak learner labels confident rejects
+            if self.basl_trainer is not None and len(X_rejects_pool) > 0:
+                X_new, y_new, remaining_indices, _ = self.basl_trainer.label_one_iteration(
+                    X_labeled, y_labeled, X_rejects_pool
+                )
 
-            # Oracle: evaluate on holdout
-            oracle_metrics = compute_metrics(y_H, scores_H, metrics, eval_cfg.accept_rate)
+                # Update labeled set with newly labeled rejects
+                if len(X_new) > 0:
+                    X_labeled = np.vstack([X_labeled, X_new])
+                    y_labeled = np.concatenate([y_labeled, y_new])
 
-            # Accepts-based: evaluate on D_a only
-            accepts_metrics = compute_metrics(y_a_curr, scores_a, metrics, eval_cfg.accept_rate)
+                # Update reject pool (shrinks as rejects get labeled)
+                X_rejects_pool = X_rejects_pool[remaining_indices]
 
-            # Bayesian: posterior sampling on D_a + D_r
-            if len(scores_r) > 0:
-                bayes_result = bayesian_evaluate(y_a_curr, scores_a, scores_r, eval_cfg)
-                bayesian_metrics = {m: bayes_result["metrics"][m]["mean"] for m in metrics}
-            else:
-                bayesian_metrics = accepts_metrics.copy()
+            # Retrain XGBoost on updated labeled set
+            model.fit(X_labeled, y_labeled)
 
-            return {
-                "iteration": iteration,
-                "oracle": oracle_metrics,
-                "accepts": accepts_metrics,
-                "bayesian": bayesian_metrics,
-            }
+            # Track metrics at specified intervals
+            should_track = (iteration % track_every == 0) or (iteration == self.cfg.n_periods)
 
-        # Record initial state if tracking
-        if tracking_enabled:
-            history.append(compute_all_metrics(0))
+            if should_track:
+                iteration_metrics = self._evaluate(
+                    model,
+                    X_internal_holdout_accepts, y_internal_holdout_accepts,
+                    X_internal_holdout_rejects,
+                    X_holdout, y_holdout,
+                    iteration
+                )
+                metrics_history.append(iteration_metrics)
 
-        # Step 4: Main loop - generate, score, accept, retrain
-        mode_desc = "Acceptance loop (BASL)" if self.basl_trainer else "Acceptance loop"
-        if tracking_enabled:
-            mode_desc = f"Tracking {mode_desc}"
+            # Early stopping check
+            if es_cfg.enabled:
+                if should_track:
+                    current_metric = iteration_metrics["bayesian"][es_cfg.metric]
+                else:
+                    # Compute metrics just for early stopping check
+                    current_eval = self._evaluate(
+                        model,
+                        X_internal_holdout_accepts, y_internal_holdout_accepts,
+                        X_internal_holdout_rejects,
+                        X_holdout, y_holdout,
+                        iteration
+                    )
+                    current_metric = current_eval["bayesian"][es_cfg.metric]
 
-        for i in tqdm(range(1, self.cfg.n_periods + 1), desc=mode_desc):
-            # Generate new batch
-            batch = self.generator.generate_population(self.cfg.batch_size)
+                should_stop, best_metric, patience_counter = self._check_early_stopping(
+                    current_metric, best_metric, patience_counter, es_cfg.metric
+                )
+                if should_stop:
+                    print(f"\nEarly stopping at iteration {iteration} "
+                          f"(no improvement for {es_cfg.patience} iterations)")
+                    break
 
-            # Accept by model score
-            accepts, rejects = self._accept_by_score(batch, model, alpha)
+            # Stop if no more rejects to label (BASL mode only)
+            if self.basl_trainer is not None and len(X_rejects_pool) == 0:
+                print(f"\nStopping at iteration {iteration} (no more rejects to label)")
+                break
 
-            # Accumulate accepts (with labels) and rejects (features only)
-            D_a = pd.concat([D_a, accepts], ignore_index=True)
-            D_r = pd.concat([D_r, rejects[feature_cols]], ignore_index=True)
+        return D_a, D_r, holdout, model, metrics_history
 
-            # Retrain model
-            X_a = D_a[feature_cols].values
-            y_a = D_a["y"].values
+    def _evaluate(
+        self,
+        model: XGBoostModel,
+        X_accepts: np.ndarray,
+        y_accepts: np.ndarray,
+        X_rejects: np.ndarray,
+        X_holdout: np.ndarray,
+        y_holdout: np.ndarray,
+        iteration: int,
+    ) -> Dict[str, Any]:
+        """Three-way evaluation for Figure 2.
 
-            if self.basl_trainer:
-                # BASL mode: augment D_a with pseudo-labeled rejects, then retrain
-                X_r = D_r.values
-                X_train, y_train = self.basl_trainer.run(X_a, y_a, X_r)
-                model.fit(X_train, y_train)
-            else:
-                # Baseline mode: retrain on D_a only
-                model.fit(X_a, y_a)
+        Computes:
+        - Oracle: Metrics on external holdout with true labels
+        - Accepts: Metrics on accepts only (biased)
+        - Bayesian: Metrics using MC pseudo-labeling (Algorithm 1)
+        """
+        metrics_list = ["auc", "pauc", "brier", "abr"]
+        abr_range = self.bayesian_cfg.abr_range
 
-            # Track metrics at intervals
-            if tracking_enabled and (i % track_every == 0 or i == self.cfg.n_periods):
-                history.append(compute_all_metrics(i))
+        # Oracle: evaluate on external holdout with true labels
+        scores_holdout = model.predict_proba(X_holdout)
+        oracle_metrics = compute_metrics(
+            y_holdout, scores_holdout, metrics_list, abr_range=abr_range
+        )
 
-        # Step 5: Generate holdout if not provided
-        if H is None:
-            H = self.generator.generate_holdout()
+        # Accepts-only: evaluate on internal holdout accepts only (biased)
+        scores_accepts = model.predict_proba(X_accepts)
+        accepts_metrics = compute_metrics(
+            y_accepts, scores_accepts, metrics_list, abr_range=abr_range
+        )
 
-        # Return based on options
-        if tracking_enabled:
-            return D_a, D_r, H, model, history
-        elif return_model:
-            return D_a, D_r, H, model
-        return D_a, D_r, H
+        # Bayesian: MC pseudo-labeling on internal holdout (Algorithm 1)
+        scores_rejects = (
+            model.predict_proba(X_rejects) if len(X_rejects) > 0 else np.array([])
+        )
+
+        # Use unique seed per iteration to ensure different MC samples
+        iter_cfg = BayesianEvalConfig(
+            n_bands=self.bayesian_cfg.n_bands,
+            j_min=self.bayesian_cfg.j_min,
+            j_max=self.bayesian_cfg.j_max,
+            epsilon=self.bayesian_cfg.epsilon,
+            prior_alpha=self.bayesian_cfg.prior_alpha,
+            prior_beta=self.bayesian_cfg.prior_beta,
+            random_seed=self.bayesian_cfg.random_seed + iteration,
+            abr_range=self.bayesian_cfg.abr_range,
+        )
+
+        bayesian_result = bayesian_evaluate(
+            y_accepts, scores_accepts, scores_rejects,
+            cfg=iter_cfg,
+            metrics_list=metrics_list,
+        )
+
+        # Extract mean values for consistency with other metrics
+        bayesian_metrics = {
+            metric: bayesian_result[metric]["mean"]
+            for metric in metrics_list
+        }
+
+        return {
+            "iteration": iteration,
+            "oracle": oracle_metrics,
+            "accepts": accepts_metrics,
+            "bayesian": bayesian_metrics,
+            "bayesian_full": bayesian_result,  # Include full posterior stats
+        }

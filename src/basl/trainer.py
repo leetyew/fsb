@@ -1,13 +1,14 @@
 """
 BASL Trainer: Orchestrates filtering and labeling stages.
 
-Returns augmented data (accepts + pseudo-labeled rejects) for
-external model training.
+Provides methods for iterative pseudo-labeling integrated with AcceptanceLoop:
+1. filter_rejects_once(): Filter outlier rejects (called once at start)
+2. label_one_iteration(): One iteration of weak learner labeling
 """
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -20,74 +21,82 @@ class BASLTrainer:
     """Orchestrates BASL filtering and pseudo-labeling stages.
 
     BASL (Bias-Aware Self-Learning) augments the training data by:
-    1. Filtering rejects via novelty detection to remove outliers.
+    1. Filtering rejects via novelty detection to remove outliers (once).
     2. Iteratively pseudo-labeling confident rejects using a weak learner.
 
-    The caller handles final model training with the augmented data.
+    Used by AcceptanceLoop which controls iteration count via early stopping.
     """
 
     def __init__(self, cfg: BASLConfig) -> None:
         self.cfg = cfg
         self.rng = np.random.default_rng(cfg.labeling.random_seed)
+        self._fixed_thresholds: Optional[Tuple[float, float]] = None
 
-    def run(
+    def filter_rejects_once(
         self,
-        X_a: np.ndarray,
-        y_a: np.ndarray,
-        X_r: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Run BASL to create augmented training data.
+        X_accepts: np.ndarray,
+        X_rejects: np.ndarray,
+    ) -> np.ndarray:
+        """Filter rejects using novelty detection (Isolation Forest).
+
+        Should be called ONCE at the start before iterative labeling.
 
         Args:
-            X_a: Accept features (n_accepts, n_features).
-            y_a: Accept labels (n_accepts,).
-            X_r: Reject features (n_rejects, n_features). No labels available.
+            X_accepts: Accept features for training novelty detector.
+            X_rejects: Reject features to filter.
 
         Returns:
-            Tuple of (X_augmented, y_augmented):
-            - X_augmented: Accepts + pseudo-labeled rejects.
-            - y_augmented: Labels for augmented data.
+            Filtered reject features (outliers removed).
         """
-        # Stage 1: Filter rejects via novelty detection
-        X_r_filtered, _ = filter_rejects(X_a, X_r, self.cfg.filtering)
+        X_r_filtered, _ = filter_rejects(X_accepts, X_rejects, self.cfg.filtering)
+        return X_r_filtered
 
-        if len(X_r_filtered) == 0:
-            # No rejects passed filtering, return accepts only
-            return X_a.copy(), y_a.copy()
+    def label_one_iteration(
+        self,
+        X_labeled: np.ndarray,
+        y_labeled: np.ndarray,
+        X_rejects_pool: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[float, float]]:
+        """Perform one iteration of pseudo-labeling.
 
-        # Stage 2: Initialize labeled and unlabeled sets
-        L_X = X_a.copy()
-        L_y = y_a.copy()
-        U_X = X_r_filtered.copy()
+        Called iteratively by AcceptanceLoop. Thresholds are fixed after
+        the first call.
 
-        # Stage 3: Iterative pseudo-labeling
-        fixed_thresholds = None
+        Args:
+            X_labeled: Current labeled features (accepts + pseudo-labeled rejects).
+            y_labeled: Current labels.
+            X_rejects_pool: Remaining unlabeled reject features.
 
-        for j in range(self.cfg.max_iterations):
-            if len(U_X) == 0:
-                # No more rejects to label
-                break
-
-            # Perform one labeling iteration
-            X_new, y_new, remaining_indices, thresholds = label_rejects_iteration(
-                X_labeled=L_X,
-                y_labeled=L_y,
-                X_rejects_pool=U_X,
-                cfg=self.cfg.labeling,
-                rng=self.rng,
-                fixed_thresholds=fixed_thresholds,
+        Returns:
+            Tuple of (X_new, y_new, remaining_pool_indices, thresholds):
+            - X_new: Features of newly labeled rejects this iteration.
+            - y_new: Pseudo-labels for newly labeled rejects.
+            - remaining_pool_indices: Indices of rejects still in pool.
+            - thresholds: (tau_good, tau_bad) used this iteration.
+        """
+        if len(X_rejects_pool) == 0:
+            return (
+                np.array([]).reshape(0, X_labeled.shape[1]),
+                np.array([], dtype=int),
+                np.array([], dtype=int),
+                self._fixed_thresholds or (0.0, 1.0),
             )
 
-            # Fix thresholds after first iteration
-            if j == 0:
-                fixed_thresholds = thresholds
+        X_new, y_new, remaining_indices, thresholds = label_rejects_iteration(
+            X_labeled=X_labeled,
+            y_labeled=y_labeled,
+            X_rejects_pool=X_rejects_pool,
+            cfg=self.cfg.labeling,
+            rng=self.rng,
+            fixed_thresholds=self._fixed_thresholds,
+        )
 
-            # Append newly labeled rejects to labeled set
-            if len(X_new) > 0:
-                L_X = np.vstack([L_X, X_new])
-                L_y = np.concatenate([L_y, y_new])
+        # Fix thresholds after first iteration
+        if self._fixed_thresholds is None:
+            self._fixed_thresholds = thresholds
 
-            # Update pool to remaining unlabeled rejects
-            U_X = U_X[remaining_indices]
+        return X_new, y_new, remaining_indices, thresholds
 
-        return L_X, L_y
+    def reset_thresholds(self) -> None:
+        """Reset fixed thresholds for a new training session."""
+        self._fixed_thresholds = None

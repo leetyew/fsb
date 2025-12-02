@@ -1,0 +1,26 @@
+# Bayesian Evaluation Configuration
+# Based on paper Algorithm 1 and Table E.9
+
+# Number of score bands for stratification
+n_bands: 10
+
+# Monte Carlo convergence parameters
+# Paper uses j_min=100, j_max=10^6, epsilon=10^-6
+# Reduced j_max for tractability (100 seeds × 50 checkpoints × j_max)
+j_min: 100      # Minimum MC samples before convergence check
+j_max: 1000     # Maximum MC samples (paper: 10^6, reduced for speed)
+epsilon: 1.0e-6 # Convergence threshold
+
+# Beta prior parameters
+# Beta(1,1) = uniform distribution = uninformative prior
+# Means we assume any bad rate 0-100% is equally likely before seeing data
+prior_alpha: 1.0
+prior_beta: 1.0
+
+# ABR integration range (paper Section 6.3)
+# "Specifically, we integrate the ABR over acceptance between 20% and 40%,
+#  which reflects historical policies at Monedo."
+abr_range: [0.2, 0.4]
+
+# Random seed
+random_seed: 42

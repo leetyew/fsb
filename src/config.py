@@ -8,7 +8,7 @@ Config files are stored in configs/ directory.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Tuple
 
 import yaml
 from pydantic import BaseModel, Field
@@ -84,6 +84,18 @@ class XGBoostConfig(BaseModel):
         return cls(**load_yaml(path))
 
 
+class EarlyStoppingConfig(BaseModel):
+    """Configuration for early stopping during training loop.
+
+    Stops training when the evaluation metric stops improving.
+    """
+
+    enabled: bool = True
+    metric: str = "auc"  # Metric to monitor: auc, pauc, brier, abr
+    patience: int = 10  # Stop if no improvement for N iterations
+    min_delta: float = 0.001  # Minimum improvement to count as progress
+
+
 class AcceptanceLoopConfig(BaseModel):
     """Configuration for acceptance loop simulation.
 
@@ -96,6 +108,8 @@ class AcceptanceLoopConfig(BaseModel):
     initial_batch_size: int = 100
     x_v_feature: str = "x0"  # Feature for initial acceptance (before model exists)
     random_seed: int = 42
+    train_holdout_split: float = 0.7  # 70% train, 30% holdout
+    early_stopping: EarlyStoppingConfig = Field(default_factory=EarlyStoppingConfig)
 
     @classmethod
     def from_yaml(cls, path: Path | str | None = None) -> AcceptanceLoopConfig:
@@ -159,7 +173,6 @@ class ExperimentConfig(BaseModel):
 
     n_seeds: int = 100  # Paper uses 100 simulation trials
     start_seed: int = 0
-    n_bayes_samples: int = 1000  # Monte Carlo samples for Bayesian eval
     track_every: int = 10  # Iteration tracking interval for Figure 2
 
     @classmethod
@@ -171,4 +184,34 @@ class ExperimentConfig(BaseModel):
         """
         if path is None:
             path = CONFIGS_DIR / "experiment.yaml"
+        return cls(**load_yaml(path))
+
+
+class BayesianEvalConfig(BaseModel):
+    """Configuration for Bayesian evaluation (Algorithm 1).
+
+    Default values from paper Table E.9 and Section 6.3.
+    """
+
+    n_bands: int = 10  # K: number of score bands
+    j_min: int = 100  # Minimum MC samples before convergence check
+    j_max: int = 1000  # Maximum MC samples (paper: 10^6, reduced for speed)
+    epsilon: float = 1e-6  # Convergence threshold
+    prior_alpha: float = 1.0  # Beta prior alpha (uninformative)
+    prior_beta: float = 1.0  # Beta prior beta (uninformative)
+    random_seed: int = 42
+
+    # ABR integration range (paper Section 6.3: "integrate ABR over acceptance
+    # between 20% and 40%, which reflects historical policies at Monedo")
+    abr_range: Tuple[float, float] = (0.2, 0.4)
+
+    @classmethod
+    def from_yaml(cls, path: Path | str | None = None) -> "BayesianEvalConfig":
+        """Load config from YAML file.
+
+        Args:
+            path: Path to YAML file. If None, uses configs/bayesian_eval.yaml.
+        """
+        if path is None:
+            path = CONFIGS_DIR / "bayesian_eval.yaml"
         return cls(**load_yaml(path))

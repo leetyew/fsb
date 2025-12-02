@@ -7,3 +7,13 @@ target_accept_rate: 0.15  # α: acceptance rate
 initial_batch_size: 100   # Bootstrap batch size
 x_v_feature: "x0"         # Feature for initial acceptance (before model exists)
 random_seed: 42
+
+# Train/holdout split (70% train, 30% holdout)
+train_holdout_split: 0.7
+
+# Early stopping configuration
+early_stopping:
+  enabled: true
+  metric: "auc"           # Metric to monitor: auc, pauc, brier, abr
+  patience: 10            # Stop if no improvement for N iterations
+  min_delta: 0.001        # Minimum improvement to count as progress
