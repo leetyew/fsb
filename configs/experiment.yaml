@@ -1,0 +1,12 @@
+# Experiment configuration
+# Based on paper Table E.9 and Section 7.1.1
+
+# Multi-seed experiment (paper uses 100 simulation trials)
+n_seeds: 100
+start_seed: 0
+
+# Bayesian evaluation
+n_bayes_samples: 1000
+
+# Iteration tracking (for Figure 2 replication)
+track_every: 10

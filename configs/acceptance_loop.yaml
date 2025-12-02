@@ -1,0 +1,9 @@
+# Acceptance loop simulation config
+# Based on paper Appendix C.1
+
+n_periods: 500            # Number of lending iterations
+batch_size: 100           # n: applicants per period
+target_accept_rate: 0.15  # α: acceptance rate
+initial_batch_size: 100   # Bootstrap batch size
+x_v_feature: "x0"         # Feature for initial acceptance (before model exists)
+random_seed: 42
