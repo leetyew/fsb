@@ -81,6 +81,7 @@ def run_trial(
     basl_cfg: BASLConfig,
     bayesian_cfg: BayesianEvalConfig,
     track_every: int = 10,
+    show_progress: bool = True,
 ) -> dict[str, Any]:
     """Run a single trial with iteration tracking.
 
@@ -95,22 +96,24 @@ def run_trial(
     generator_holdout = SyntheticGenerator(data_cfg)
     holdout = generator_holdout.generate_holdout()
 
-    print(f"\n  Seed {seed}: Running baseline loop...")
+    if show_progress:
+        tqdm.write(f"  Seed {seed}: Running baseline loop...")
     generator_base = SyntheticGenerator(data_cfg)
     loop_base = AcceptanceLoop(
         generator_base, model_cfg, loop_cfg, basl_cfg=None, bayesian_cfg=bayesian_cfg
     )
     D_a_base, D_r_base, _, baseline_model, baseline_history = loop_base.run(
-        holdout=holdout, track_every=track_every
+        holdout=holdout, track_every=track_every, show_progress=show_progress
     )
 
-    print(f"  Seed {seed}: Running BASL loop...")
+    if show_progress:
+        tqdm.write(f"  Seed {seed}: Running BASL loop...")
     generator_basl = SyntheticGenerator(data_cfg)
     loop_basl = AcceptanceLoop(
         generator_basl, model_cfg, loop_cfg, basl_cfg=basl_cfg, bayesian_cfg=bayesian_cfg
     )
     D_a_basl, D_r_basl, _, basl_model, basl_history = loop_basl.run(
-        holdout=holdout, track_every=track_every
+        holdout=holdout, track_every=track_every, show_progress=show_progress
     )
 
     return {
@@ -260,23 +263,37 @@ def main():
     print(f"  Seeds: {seeds}")
     print(f"  n_periods: {loop_cfg.n_periods}")
     print(f"  track_every: {track_every}")
-    print(f"  train_holdout_split: {loop_cfg.train_holdout_split}")
-    print(f"  early_stopping: {loop_cfg.early_stopping.metric} (patience={loop_cfg.early_stopping.patience})")
+    print(f"  basl_max_iterations: {basl_cfg.max_iterations} (jmax)")
     print(f"  bayesian_eval: j_max={bayesian_cfg.j_max}")
     print("=" * 70)
 
     # Run trials
+    # Show detailed progress for single seed, only outer tqdm for multi-seed
+    single_seed = len(seeds) == 1
     trials = []
-    for seed in tqdm(seeds, desc="Seeds"):
-        trial = run_trial(
-            seed, data_cfg, model_cfg, loop_cfg, basl_cfg, bayesian_cfg, track_every
-        )
-        trials.append(trial)
 
-        # Save individual trial
-        trial_path = exp_dir / f"trial_seed{seed}.json"
-        with open(trial_path, "w") as f:
-            json.dump(convert_numpy(trial), f, indent=2)
+    if single_seed:
+        # Single seed: show detailed progress
+        for seed in seeds:
+            trial = run_trial(
+                seed, data_cfg, model_cfg, loop_cfg, basl_cfg, bayesian_cfg,
+                track_every, show_progress=True
+            )
+            trials.append(trial)
+            trial_path = exp_dir / f"trial_seed{seed}.json"
+            with open(trial_path, "w") as f:
+                json.dump(convert_numpy(trial), f, indent=2)
+    else:
+        # Multi-seed: show only seeds progress bar
+        for seed in tqdm(seeds, desc="Seeds"):
+            trial = run_trial(
+                seed, data_cfg, model_cfg, loop_cfg, basl_cfg, bayesian_cfg,
+                track_every, show_progress=False
+            )
+            trials.append(trial)
+            trial_path = exp_dir / f"trial_seed{seed}.json"
+            with open(trial_path, "w") as f:
+                json.dump(convert_numpy(trial), f, indent=2)
 
     # Aggregate if multiple trials
     if len(trials) > 1:
@@ -291,8 +308,6 @@ def main():
         "seeds": seeds,
         "track_every": track_every,
         "n_periods": loop_cfg.n_periods,
-        "train_holdout_split": loop_cfg.train_holdout_split,
-        "early_stopping": loop_cfg.early_stopping.model_dump(),
         "data_cfg": data_cfg.model_dump(),
         "model_cfg": model_cfg.model_dump(),
         "loop_cfg": loop_cfg.model_dump(),

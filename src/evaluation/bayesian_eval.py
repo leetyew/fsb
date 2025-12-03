@@ -5,11 +5,16 @@ Implements the paper's Algorithm 1: Bayesian Evaluation Framework.
 Uses Monte Carlo sampling with convergence checking to estimate
 performance metrics on the full population (accepts + rejects).
 
+Two modes available:
+1. Direct mode (paper-faithful): Each reject's pseudo-label sampled using
+   model's predicted probability directly: y^r ~ Binomial(1, P(y^r|X^r))
+2. Banded mode (variance reduction): Stratify by score bands and use
+   Beta posteriors estimated from accepts in each band.
+
 Key parameters from Table E.9:
 - j_min = 100 (minimum MC samples before convergence check)
 - j_max = 10^6 (maximum MC samples)
 - ε = 10^-6 (convergence threshold)
-- K = 10 (number of score bands)
 """
 
 from __future__ import annotations
@@ -43,7 +48,19 @@ def _assign_score_bands(
     return bands
 
 
-def _pseudo_label_rejects_once(
+def _pseudo_label_rejects_direct(
+    scores_rejects: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Paper-faithful pseudo-labeling: use model predictions directly.
+
+    Per Algorithm 1: y^r ~ Binomial(1, P(y^r | X^r))
+    Each reject gets a coin flip using its own predicted probability.
+    """
+    return rng.binomial(1, scores_rejects).astype(int)
+
+
+def _pseudo_label_rejects_banded(
     y_accepts: np.ndarray,
     bands_accepts: np.ndarray,
     bands_rejects: np.ndarray,
@@ -52,7 +69,7 @@ def _pseudo_label_rejects_once(
     prior_beta: float,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Single MC iteration: pseudo-label rejects via coin flip.
+    """Banded pseudo-labeling with Beta posteriors (variance reduction).
 
     For each score band:
     1. Compute bad rate from accepts in that band
@@ -92,8 +109,9 @@ def bayesian_evaluate(
     """Bayesian evaluation with MC convergence (Algorithm 1).
 
     Runs Monte Carlo iterations to estimate performance metrics on the full
-    population. Each iteration pseudo-labels rejects using band-specific
-    bad rates sampled from Beta posteriors.
+    population. Each iteration pseudo-labels rejects using either:
+    - Direct mode (cfg.use_banding=False, default): y^r ~ Binomial(1, P(y^r|X^r))
+    - Banded mode (cfg.use_banding=True): stratify by score bands and use Beta posteriors
 
     Convergence: Stops when running mean changes by less than epsilon,
     or when j_max iterations are reached.
@@ -102,7 +120,7 @@ def bayesian_evaluate(
         y_accepts: True labels for accepts (0=good, 1=bad).
         scores_accepts: Predicted scores for accepts.
         scores_rejects: Predicted scores for rejects.
-        cfg: Bayesian evaluation configuration (includes abr_range).
+        cfg: Bayesian evaluation configuration (includes use_banding, abr_range, etc.).
         metrics_list: Metrics to compute. Default: ["auc", "pauc", "brier", "abr"].
 
     Returns:
@@ -130,11 +148,14 @@ def bayesian_evaluate(
             for metric, val in base_metrics.items()
         } | {"n_samples": 1, "converged": True}
 
-    # Precompute band assignments (shared across all MC iterations)
+    # Combine scores for evaluation
     all_scores = np.concatenate([scores_accepts, scores_rejects])
-    all_bands = _assign_score_bands(all_scores, cfg.n_bands)
-    bands_accepts = all_bands[:n_accepts]
-    bands_rejects = all_bands[n_accepts:]
+
+    # Precompute band assignments only if using banded mode
+    if cfg.use_banding:
+        all_bands = _assign_score_bands(all_scores, cfg.n_bands)
+        bands_accepts = all_bands[:n_accepts]
+        bands_rejects = all_bands[n_accepts:]
 
     # Storage for MC samples
     metric_samples: dict[str, list[float]] = {m: [] for m in metrics_list}
@@ -145,10 +166,14 @@ def bayesian_evaluate(
 
     for j in range(1, cfg.j_max + 1):
         # Pseudo-label rejects for this MC iteration
-        y_rejects_pseudo = _pseudo_label_rejects_once(
-            y_accepts, bands_accepts, bands_rejects,
-            cfg.n_bands, cfg.prior_alpha, cfg.prior_beta, rng
-        )
+        if cfg.use_banding:
+            y_rejects_pseudo = _pseudo_label_rejects_banded(
+                y_accepts, bands_accepts, bands_rejects,
+                cfg.n_bands, cfg.prior_alpha, cfg.prior_beta, rng
+            )
+        else:
+            # Paper-faithful: use model predictions directly
+            y_rejects_pseudo = _pseudo_label_rejects_direct(scores_rejects, rng)
 
         # Combine accepts and pseudo-labeled rejects
         y_combined = np.concatenate([y_accepts, y_rejects_pseudo])
@@ -202,20 +227,21 @@ def pseudo_label_rejects_stochastic(
     prior_alpha: float = 1.0,
     prior_beta: float = 1.0,
     rng: np.random.Generator | None = None,
+    use_banding: bool = False,
 ) -> np.ndarray:
-    """Single stochastic pseudo-labeling of rejects (simplified version).
+    """Single stochastic pseudo-labeling of rejects.
 
-    This is the simplified version that does one coin flip per call.
     For proper Bayesian evaluation, use bayesian_evaluate() with MC sampling.
 
     Args:
         y_accepts: True labels for accepts (0=good, 1=bad).
         scores_accepts: Predicted scores for accepts.
         scores_rejects: Predicted scores for rejects (no labels).
-        n_bands: Number of score bands for stratification.
-        prior_alpha: Beta prior alpha (uninformative default).
-        prior_beta: Beta prior beta (uninformative default).
+        n_bands: Number of score bands for stratification (only used if use_banding=True).
+        prior_alpha: Beta prior alpha (only used if use_banding=True).
+        prior_beta: Beta prior beta (only used if use_banding=True).
         rng: Random number generator. If None, creates one.
+        use_banding: If True, use banded mode. If False (default), use direct mode.
 
     Returns:
         Pseudo-labels for rejects (shape: n_rejects).
@@ -223,20 +249,24 @@ def pseudo_label_rejects_stochastic(
     if rng is None:
         rng = np.random.default_rng()
 
-    n_accepts = len(y_accepts)
     n_rejects = len(scores_rejects)
 
     if n_rejects == 0:
         return np.array([], dtype=int)
 
-    # Combine scores for band assignment
+    if not use_banding:
+        # Paper-faithful: use model predictions directly
+        return _pseudo_label_rejects_direct(scores_rejects, rng)
+
+    # Banded mode: use Beta posteriors per band
+    n_accepts = len(y_accepts)
     all_scores = np.concatenate([scores_accepts, scores_rejects])
     all_bands = _assign_score_bands(all_scores, n_bands)
 
     bands_accepts = all_bands[:n_accepts]
     bands_rejects = all_bands[n_accepts:]
 
-    return _pseudo_label_rejects_once(
+    return _pseudo_label_rejects_banded(
         y_accepts, bands_accepts, bands_rejects,
         n_bands, prior_alpha, prior_beta, rng
     )

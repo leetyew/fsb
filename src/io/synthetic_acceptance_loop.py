@@ -1,10 +1,11 @@
 """
 Acceptance loop simulation with integrated training and evaluation.
 
-Implements the paper's approach where:
-- Training side: Weak learner pseudo-labels rejects (deterministic via BASL)
+Implements the paper's approach (Algorithm C.2) where:
+- Training side: BASL pseudo-labels rejects (up to jmax iterations per training call)
 - Evaluation side: Monte Carlo pseudo-labeling with convergence (Algorithm 1)
-- Configurable train/holdout split at accepts AND rejects level
+- Loop runs for all n_periods without early stopping (per paper Section 6.1)
+- All accepts used for training; separate holdout for oracle evaluation
 """
 
 from __future__ import annotations
@@ -62,59 +63,24 @@ class AcceptanceLoop:
         accept_mask = df[feature] <= threshold
         return df[accept_mask].copy(), df[~accept_mask].copy()
 
-    def _split_train_holdout(
-        self, df: pd.DataFrame, train_ratio: float
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Split dataframe into train and holdout sets."""
-        n = len(df)
-        n_train = int(n * train_ratio)
-        indices = self.rng.permutation(n)
-        train_indices = indices[:n_train]
-        holdout_indices = indices[n_train:]
-        return df.iloc[train_indices].copy(), df.iloc[holdout_indices].copy()
-
-    def _check_early_stopping(
-        self,
-        current_metric: float,
-        best_metric: Optional[float],
-        patience_counter: int,
-        metric_name: str,
-    ) -> Tuple[bool, Optional[float], int]:
-        """Check if early stopping should trigger.
-
-        Returns:
-            (should_stop, new_best_metric, new_patience_counter)
-        """
-        es_cfg = self.cfg.early_stopping
-
-        # Higher is better for AUC/PAUC, lower is better for Brier/ABR
-        higher_is_better = metric_name in ["auc", "pauc"]
-
-        if best_metric is None:
-            return False, current_metric, 0
-
-        if higher_is_better:
-            improved = current_metric > best_metric + es_cfg.min_delta
-        else:
-            improved = current_metric < best_metric - es_cfg.min_delta
-
-        if improved:
-            return False, current_metric, 0
-        else:
-            new_counter = patience_counter + 1
-            should_stop = new_counter >= es_cfg.patience
-            return should_stop, best_metric, new_counter
-
     def run(
         self,
         holdout: pd.DataFrame,
         track_every: int = 1,
+        show_progress: bool = True,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, XGBoostModel, List[Dict[str, Any]]]:
-        """Run the integrated training and evaluation loop.
+        """Run the integrated training and evaluation loop per Algorithm C.2.
+
+        Per paper Section 6.1:
+        - New batch of applicants arrives each period
+        - Model makes accept/reject decisions based on target_accept_rate
+        - Accepts get observed labels, training data grows over time
+        - Loop runs for all n_periods without early stopping
 
         Args:
             holdout: External holdout for oracle evaluation.
             track_every: Track metrics every N iterations.
+            show_progress: Whether to show tqdm progress bar.
 
         Returns:
             (D_a, D_r, holdout, model, metrics_history)
@@ -122,96 +88,107 @@ class AcceptanceLoop:
         """
         feature_cols = [f"x{i}" for i in range(self.generator.cfg.n_features)]
         alpha = self.cfg.target_accept_rate
-        train_ratio = self.cfg.train_holdout_split
-        es_cfg = self.cfg.early_stopping
 
-        # Step 1: Generate initial population
-        total_applicants = self.cfg.initial_batch_size + (
-            self.cfg.batch_size * self.cfg.n_periods
-        )
-        population = self.generator.generate_population(total_applicants)
-
-        # Step 2: Initial acceptance using x_v (simulates initial lending decision)
-        accepts_df, rejects_df = self._accept_by_feature(
-            population, self.cfg.x_v_feature, alpha
-        )
-
-        # Step 3: Split at accepts AND rejects level using configured ratio
-        train_accepts, internal_holdout_accepts = self._split_train_holdout(
-            accepts_df, train_ratio
-        )
-        train_rejects, internal_holdout_rejects = self._split_train_holdout(
-            rejects_df, train_ratio
-        )
-
-        # Extract features and labels for training
-        X_train_accepts = train_accepts[feature_cols].values
-        y_train_accepts = train_accepts["y"].values
-        X_train_rejects = train_rejects[feature_cols].values
-
-        # Internal holdout for Bayesian evaluation (coin flip)
-        X_internal_holdout_accepts = internal_holdout_accepts[feature_cols].values
-        y_internal_holdout_accepts = internal_holdout_accepts["y"].values
-        X_internal_holdout_rejects = internal_holdout_rejects[feature_cols].values
-
-        # External holdout for oracle evaluation
+        # External holdout for oracle evaluation (drawn separately per Algorithm C.2)
         X_holdout = holdout[feature_cols].values
         y_holdout = holdout["y"].values
 
-        # Step 4: Filter train_rejects with Isolation Forest (once) - only for BASL mode
-        if self.basl_trainer is not None:
-            X_train_rejects_filtered = self.basl_trainer.filter_rejects_once(
-                X_train_accepts, X_train_rejects
-            )
-        else:
-            X_train_rejects_filtered = X_train_rejects
+        # Step 1: Generate initial batch and accept by feature (no model yet)
+        initial_batch = self.generator.generate_population(self.cfg.initial_batch_size)
+        initial_accepts, initial_rejects = self._accept_by_feature(
+            initial_batch, self.cfg.x_v_feature, alpha
+        )
 
-        # Initialize training state
-        X_labeled = X_train_accepts.copy()
-        y_labeled = y_train_accepts.copy()
-        X_rejects_pool = X_train_rejects_filtered.copy()
+        # Initialize cumulative accepts and rejects
+        all_accepts = [initial_accepts]
+        all_rejects = [initial_rejects]
 
-        # Track accumulated D_a and D_r as DataFrames for return
-        D_a = train_accepts.copy()
-        D_r = train_rejects.copy()
+        X_accepts = initial_accepts[feature_cols].values
+        y_accepts = initial_accepts["y"].values
+        X_rejects = initial_rejects[feature_cols].values
 
-        # Initialize XGBoost model
+        # Initialize model on first accepts
         model = XGBoostModel(self.model_cfg)
-        model.fit(X_labeled, y_labeled)
+        model.fit(X_accepts, y_accepts)
+
+        # For BASL: filter rejects and prepare pseudo-labeling pool
+        if self.basl_trainer is not None:
+            X_rejects_filtered = self.basl_trainer.filter_rejects_once(
+                X_accepts, X_rejects
+            )
+            X_labeled = X_accepts.copy()
+            y_labeled = y_accepts.copy()
+            X_rejects_pool = X_rejects_filtered.copy()
+        else:
+            X_labeled = X_accepts.copy()
+            y_labeled = y_accepts.copy()
+            X_rejects_pool = X_rejects.copy()
 
         # Tracking state
         metrics_history: List[Dict[str, Any]] = []
-        best_metric: Optional[float] = None
-        patience_counter = 0
 
         # Initial evaluation (iteration 0)
         initial_metrics = self._evaluate(
             model,
-            X_internal_holdout_accepts, y_internal_holdout_accepts,
-            X_internal_holdout_rejects,
+            X_accepts, y_accepts,
+            X_rejects_pool,
             X_holdout, y_holdout,
             0
         )
         metrics_history.append(initial_metrics)
-        best_metric = initial_metrics["bayesian"][es_cfg.metric]
 
-        # Step 5: Main training loop
-        for iteration in tqdm(range(1, self.cfg.n_periods + 1), desc="Training loop"):
-            # BASL mode: weak learner labels confident rejects
+        # Step 2: Main loop - process new batches each period
+        iterator = range(1, self.cfg.n_periods + 1)
+        if show_progress:
+            iterator = tqdm(iterator, desc="Training loop", leave=True, dynamic_ncols=True)
+
+        for iteration in iterator:
+            # Generate new batch of applicants this period
+            batch = self.generator.generate_population(self.cfg.batch_size)
+
+            # Model makes accept/reject decisions (accept top α by predicted score)
+            batch_X = batch[feature_cols].values
+            batch_scores = model.predict_proba(batch_X)
+
+            # Accept those with lowest predicted bad rate (top α percentile)
+            threshold = np.percentile(batch_scores, alpha * 100)
+            accept_mask = batch_scores <= threshold
+
+            batch_accepts = batch[accept_mask].copy()
+            batch_rejects = batch[~accept_mask].copy()
+
+            # Accumulate for final return
+            all_accepts.append(batch_accepts)
+            all_rejects.append(batch_rejects)
+
+            # Add new accepts to training data (observed labels)
+            if len(batch_accepts) > 0:
+                new_X = batch_accepts[feature_cols].values
+                new_y = batch_accepts["y"].values
+                X_accepts = np.vstack([X_accepts, new_X])
+                y_accepts = np.concatenate([y_accepts, new_y])
+                X_labeled = np.vstack([X_labeled, new_X])
+                y_labeled = np.concatenate([y_labeled, new_y])
+
+            # Add new rejects to pool (for Bayesian eval and BASL)
+            if len(batch_rejects) > 0:
+                new_X_rejects = batch_rejects[feature_cols].values
+                if self.basl_trainer is not None:
+                    # Filter new rejects before adding to pool
+                    new_filtered = self.basl_trainer.filter_rejects_once(
+                        X_accepts, new_X_rejects
+                    )
+                    X_rejects_pool = np.vstack([X_rejects_pool, new_filtered])
+                else:
+                    X_rejects_pool = np.vstack([X_rejects_pool, new_X_rejects])
+
+            # BASL mode: run pseudo-labeling iterations
             if self.basl_trainer is not None and len(X_rejects_pool) > 0:
-                X_new, y_new, remaining_indices, _ = self.basl_trainer.label_one_iteration(
+                X_labeled, y_labeled, X_rejects_pool = self._run_basl_labeling(
                     X_labeled, y_labeled, X_rejects_pool
                 )
 
-                # Update labeled set with newly labeled rejects
-                if len(X_new) > 0:
-                    X_labeled = np.vstack([X_labeled, X_new])
-                    y_labeled = np.concatenate([y_labeled, y_new])
-
-                # Update reject pool (shrinks as rejects get labeled)
-                X_rejects_pool = X_rejects_pool[remaining_indices]
-
-            # Retrain XGBoost on updated labeled set
+            # Retrain model on updated labeled set
             model.fit(X_labeled, y_labeled)
 
             # Track metrics at specified intervals
@@ -220,42 +197,60 @@ class AcceptanceLoop:
             if should_track:
                 iteration_metrics = self._evaluate(
                     model,
-                    X_internal_holdout_accepts, y_internal_holdout_accepts,
-                    X_internal_holdout_rejects,
+                    X_accepts, y_accepts,
+                    X_rejects_pool,
                     X_holdout, y_holdout,
                     iteration
                 )
                 metrics_history.append(iteration_metrics)
 
-            # Early stopping check
-            if es_cfg.enabled:
-                if should_track:
-                    current_metric = iteration_metrics["bayesian"][es_cfg.metric]
-                else:
-                    # Compute metrics just for early stopping check
-                    current_eval = self._evaluate(
-                        model,
-                        X_internal_holdout_accepts, y_internal_holdout_accepts,
-                        X_internal_holdout_rejects,
-                        X_holdout, y_holdout,
-                        iteration
-                    )
-                    current_metric = current_eval["bayesian"][es_cfg.metric]
-
-                should_stop, best_metric, patience_counter = self._check_early_stopping(
-                    current_metric, best_metric, patience_counter, es_cfg.metric
-                )
-                if should_stop:
-                    print(f"\nEarly stopping at iteration {iteration} "
-                          f"(no improvement for {es_cfg.patience} iterations)")
-                    break
-
-            # Stop if no more rejects to label (BASL mode only)
-            if self.basl_trainer is not None and len(X_rejects_pool) == 0:
-                print(f"\nStopping at iteration {iteration} (no more rejects to label)")
-                break
+        # Combine all accepts/rejects for return
+        D_a = pd.concat(all_accepts, ignore_index=True)
+        D_r = pd.concat(all_rejects, ignore_index=True)
 
         return D_a, D_r, holdout, model, metrics_history
+
+    def _run_basl_labeling(
+        self,
+        X_labeled: np.ndarray,
+        y_labeled: np.ndarray,
+        X_rejects_pool: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Run BASL labeling for up to max_iterations (jmax from paper).
+
+        Per paper Section 5.4: BASL iterates up to jmax times, stopping early
+        if no new rejects are labeled in an iteration.
+
+        Args:
+            X_labeled: Current labeled features (accepts + pseudo-labeled rejects).
+            y_labeled: Current labels.
+            X_rejects_pool: Remaining unlabeled reject features.
+
+        Returns:
+            (X_labeled, y_labeled, X_rejects_pool) after labeling iterations.
+        """
+        max_iters = self.basl_cfg.max_iterations if self.basl_cfg else 1
+
+        for _ in range(max_iters):
+            if len(X_rejects_pool) == 0:
+                break
+
+            X_new, y_new, remaining_indices, _ = self.basl_trainer.label_one_iteration(
+                X_labeled, y_labeled, X_rejects_pool
+            )
+
+            # Early stopping for BASL: no new labels this iteration
+            if len(X_new) == 0:
+                break
+
+            # Update labeled set with newly labeled rejects
+            X_labeled = np.vstack([X_labeled, X_new])
+            y_labeled = np.concatenate([y_labeled, y_new])
+
+            # Update reject pool (shrinks as rejects get labeled)
+            X_rejects_pool = X_rejects_pool[remaining_indices]
+
+        return X_labeled, y_labeled, X_rejects_pool
 
     def _evaluate(
         self,

@@ -84,22 +84,13 @@ class XGBoostConfig(BaseModel):
         return cls(**load_yaml(path))
 
 
-class EarlyStoppingConfig(BaseModel):
-    """Configuration for early stopping during training loop.
-
-    Stops training when the evaluation metric stops improving.
-    """
-
-    enabled: bool = True
-    metric: str = "auc"  # Metric to monitor: auc, pauc, brier, abr
-    patience: int = 10  # Stop if no improvement for N iterations
-    min_delta: float = 0.001  # Minimum improvement to count as progress
-
-
 class AcceptanceLoopConfig(BaseModel):
     """Configuration for acceptance loop simulation.
 
-    Default values from paper (Appendix C.1).
+    Per paper Section 6.1 and Algorithm C.2:
+    - Runs for all n_periods without early stopping
+    - All accepts (D^a) used for training
+    - Separate external holdout for oracle evaluation
     """
 
     n_periods: int = 500
@@ -108,8 +99,6 @@ class AcceptanceLoopConfig(BaseModel):
     initial_batch_size: int = 100
     x_v_feature: str = "x0"  # Feature for initial acceptance (before model exists)
     random_seed: int = 42
-    train_holdout_split: float = 0.7  # 70% train, 30% holdout
-    early_stopping: EarlyStoppingConfig = Field(default_factory=EarlyStoppingConfig)
 
     @classmethod
     def from_yaml(cls, path: Path | str | None = None) -> AcceptanceLoopConfig:
@@ -146,10 +135,10 @@ class BASLLabelingConfig(BaseModel):
 class BASLConfig(BaseModel):
     """Configuration for Bias-Aware Self-Learning.
 
-    Default values from paper.
+    Default values from paper (Appendix E.1).
     """
 
-    max_iterations: int = 5  # j_max from paper
+    max_iterations: int = 3  # j_max from paper (Appendix E.1: "jmax = 3")
     filtering: BASLFilteringConfig = Field(default_factory=BASLFilteringConfig)
     labeling: BASLLabelingConfig = Field(default_factory=BASLLabelingConfig)
 
@@ -191,14 +180,27 @@ class BayesianEvalConfig(BaseModel):
     """Configuration for Bayesian evaluation (Algorithm 1).
 
     Default values from paper Table E.9 and Section 6.3.
+
+    Two pseudo-labeling modes:
+    - Direct (use_banding=False, default): Paper-faithful approach where each
+      reject's label is sampled as Binomial(1, P(y^r|X^r)) using model predictions.
+    - Banded (use_banding=True): Variance reduction via score stratification,
+      using Beta posteriors estimated from accepts in each band.
     """
 
+    # Pseudo-labeling mode
+    use_banding: bool = False  # False = paper-faithful direct mode
+
+    # Banding parameters (only used when use_banding=True)
     n_bands: int = 10  # K: number of score bands
-    j_min: int = 100  # Minimum MC samples before convergence check
-    j_max: int = 1000  # Maximum MC samples (paper: 10^6, reduced for speed)
-    epsilon: float = 1e-6  # Convergence threshold
     prior_alpha: float = 1.0  # Beta prior alpha (uninformative)
     prior_beta: float = 1.0  # Beta prior beta (uninformative)
+
+    # MC convergence parameters (from paper Table E.9)
+    j_min: int = 100  # Minimum MC samples before convergence check
+    j_max: int = 100000  # Maximum MC samples (paper: 10^6, using 10^5 for speed)
+    epsilon: float = 1e-6  # Convergence threshold
+
     random_seed: int = 42
 
     # ABR integration range (paper Section 6.3: "integrate ABR over acceptance
