@@ -54,6 +54,7 @@ experiments/*
 !experiments/.gitkeep
 debug/
 CLAUDE.md
+PROBLEMS.md
 .claudecode/
 .pre-commit-config.yaml
 .env

@@ -1,7 +1,7 @@
 # BASL (Bias-Aware Self-Learning) config
 # Default values from paper (Appendix E.1)
 
-max_iterations: 3  # j_max from paper (Appendix E.1: "jmax = 3")
+max_iterations: 3  # j_max for SYNTHETIC experiments (Appendix E.1); real data uses 5
 
 filtering:
   beta_lower: 0.05  # Remove bottom 5% outliers (most dissimilar to accepts)

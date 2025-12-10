@@ -105,6 +105,7 @@ def bayesian_evaluate(
     scores_rejects: np.ndarray,
     cfg: BayesianEvalConfig,
     metrics_list: list[str] | None = None,
+    prior_scores_rejects: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Bayesian evaluation with MC convergence (Algorithm 1).
 
@@ -116,12 +117,19 @@ def bayesian_evaluate(
     Convergence: Stops when running mean changes by less than epsilon,
     or when j_max iterations are reached.
 
+    IMPORTANT: Per Algorithm 1, we separate f_eval (for metric computation) from
+    f_prior (for pseudo-labeling). This allows fair comparison across methods:
+    - scores_accepts/scores_rejects: f_eval scores used in metric computation
+    - prior_scores_rejects: f_prior scores used for sampling pseudo-labels
+
     Args:
         y_accepts: True labels for accepts (0=good, 1=bad).
-        scores_accepts: Predicted scores for accepts.
-        scores_rejects: Predicted scores for rejects.
+        scores_accepts: f_eval's predicted scores for accepts.
+        scores_rejects: f_eval's predicted scores for rejects (used in metrics).
         cfg: Bayesian evaluation configuration (includes use_banding, abr_range, etc.).
         metrics_list: Metrics to compute. Default: ["auc", "pauc", "brier", "abr"].
+        prior_scores_rejects: f_prior's scores for rejects (used for pseudo-labeling).
+            If None, uses scores_rejects (backward compatible, but not paper-faithful).
 
     Returns:
         Dictionary with posterior statistics for each metric:
@@ -148,12 +156,21 @@ def bayesian_evaluate(
             for metric, val in base_metrics.items()
         } | {"n_samples": 1, "converged": True}
 
-    # Combine scores for evaluation
-    all_scores = np.concatenate([scores_accepts, scores_rejects])
+    # Separate f_eval scores (for metrics) from f_prior scores (for pseudo-labeling)
+    # Per Algorithm 1: f_eval predicts on full population, f_prior provides pseudo-label probs
+    eval_scores_rejects = scores_rejects  # f_eval's predictions for metric computation
+    prior_probs_rejects = prior_scores_rejects if prior_scores_rejects is not None else scores_rejects
+
+    # Combine f_eval scores for evaluation (accepts + rejects all from f_eval)
+    all_scores = np.concatenate([scores_accepts, eval_scores_rejects])
 
     # Precompute band assignments only if using banded mode
+    # Note: banding uses f_eval scores for band assignment, but f_prior for label sampling
     if cfg.use_banding:
-        all_bands = _assign_score_bands(all_scores, cfg.n_bands)
+        # For banded mode, use f_prior scores for band assignment since we're stratifying
+        # the prior distribution, not the evaluation distribution
+        prior_all_scores = np.concatenate([scores_accepts, prior_probs_rejects])
+        all_bands = _assign_score_bands(prior_all_scores, cfg.n_bands)
         bands_accepts = all_bands[:n_accepts]
         bands_rejects = all_bands[n_accepts:]
 
@@ -165,15 +182,15 @@ def bayesian_evaluate(
     n_samples = 0
 
     for j in range(1, cfg.j_max + 1):
-        # Pseudo-label rejects for this MC iteration
+        # Pseudo-label rejects for this MC iteration using f_prior probabilities
         if cfg.use_banding:
             y_rejects_pseudo = _pseudo_label_rejects_banded(
                 y_accepts, bands_accepts, bands_rejects,
                 cfg.n_bands, cfg.prior_alpha, cfg.prior_beta, rng
             )
         else:
-            # Paper-faithful: use model predictions directly
-            y_rejects_pseudo = _pseudo_label_rejects_direct(scores_rejects, rng)
+            # Paper-faithful: sample labels using f_prior's predicted probabilities
+            y_rejects_pseudo = _pseudo_label_rejects_direct(prior_probs_rejects, rng)
 
         # Combine accepts and pseudo-labeled rejects
         y_combined = np.concatenate([y_accepts, y_rejects_pseudo])

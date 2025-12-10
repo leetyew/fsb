@@ -1,11 +1,12 @@
 # XGBoost model config
-# Based on paper Table E.9 (synthetic experiments)
+# Based on paper Table E.8 (synthetic experiments)
+# Note: Paper does NOT use early stopping for synthetic experiments
 
 n_estimators: 100       # max_trees
 max_depth: 3
 learning_rate: 0.1      # eta
 subsample: 0.8          # bagging_ratio
 colsample_bytree: 0.8   # feature_ratio
-early_stopping_rounds: 10  # Paper default for synthetic
-validation_fraction: 0.2   # Fraction for early stopping validation
+early_stopping_rounds: 0  # Disabled for synthetic (per Table E.8)
+validation_fraction: 0.0  # No validation split needed
 random_seed: 42

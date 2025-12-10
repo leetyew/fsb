@@ -10,7 +10,8 @@ Implements the paper's approach (Algorithm C.2) where:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, List, Dict, Any
+import copy
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,7 @@ from src.config import AcceptanceLoopConfig, BASLConfig, BayesianEvalConfig, XGB
 from src.evaluation.bayesian_eval import bayesian_evaluate
 from src.evaluation.metrics import compute_metrics
 from src.io.synthetic_generator import SyntheticGenerator
+from src.models.logistic_regression import LogisticRegressionConfig, LogisticRegressionModel
 from src.models.xgboost_model import XGBoostModel
 
 
@@ -99,43 +101,65 @@ class AcceptanceLoop:
             initial_batch, self.cfg.x_v_feature, alpha
         )
 
-        # Initialize cumulative accepts and rejects
+        # Initialize cumulative accepts and rejects (true labels only)
         all_accepts = [initial_accepts]
         all_rejects = [initial_rejects]
 
+        # X_accepts/y_accepts: cumulative TRUE accepts with observed labels
+        # These grow each iteration and NEVER include pseudo-labels
         X_accepts = initial_accepts[feature_cols].values
         y_accepts = initial_accepts["y"].values
-        X_rejects = initial_rejects[feature_cols].values
+
+        # X_rejects_for_eval: cumulative rejects for Bayesian evaluation
+        # This is the full D_r^(j) used for evaluation, grows each iteration
+        X_rejects_for_eval = initial_rejects[feature_cols].values
 
         # Initialize model on first accepts
         model = XGBoostModel(self.model_cfg)
         model.fit(X_accepts, y_accepts)
 
-        # For BASL: filter rejects and prepare pseudo-labeling pool
-        if self.basl_trainer is not None:
-            X_rejects_filtered = self.basl_trainer.filter_rejects_once(
-                X_accepts, X_rejects
-            )
-            X_labeled = X_accepts.copy()
-            y_labeled = y_accepts.copy()
-            X_rejects_pool = X_rejects_filtered.copy()
-        else:
-            X_labeled = X_accepts.copy()
-            y_labeled = y_accepts.copy()
-            X_rejects_pool = X_rejects.copy()
+        # ALWAYS create f_prior (baseline XGBoost + LR calibrator) for Bayesian evaluation
+        # Per paper Section 4.3: f_prior is SHARED by ALL methods (baseline and BASL)
+        # The difference between methods is ONLY in how f_eval is trained, not f_prior
+        # f_prior represents the "legacy/historical acceptance model" for reject priors
+        # CRITICAL: f_prior is trained ONLY on accepts with true labels, never pseudo-labels
+        baseline_model = XGBoostModel(self.model_cfg)
+        baseline_model.fit(X_accepts, y_accepts)
+        baseline_scores = baseline_model.predict_proba(X_accepts).reshape(-1, 1)
+        lr_cfg = LogisticRegressionConfig(
+            C=1.0, penalty="l2", solver="lbfgs", random_seed=self.model_cfg.random_seed
+        )
+        prior_calibrator = LogisticRegressionModel(lr_cfg)
+        prior_calibrator.fit(baseline_scores, y_accepts)
 
         # Tracking state
         metrics_history: List[Dict[str, Any]] = []
 
+        # Best model tracking (Section 4.2-4.3 from paper)
+        best_model = None
+        best_bayesian_abr = float('inf')
+        best_iteration = 0
+
         # Initial evaluation (iteration 0)
+        # Use X_rejects_for_eval (full D_r) for Bayesian evaluation, NOT the BASL pool
         initial_metrics = self._evaluate(
             model,
             X_accepts, y_accepts,
-            X_rejects_pool,
+            X_rejects_for_eval,
             X_holdout, y_holdout,
-            0
+            0,
+            baseline_model,
+            prior_calibrator,
         )
         metrics_history.append(initial_metrics)
+
+        # Initialize best model with iteration 0
+        if self.basl_trainer is not None:
+            bayesian_abr = initial_metrics['bayesian']['abr']
+            if bayesian_abr < best_bayesian_abr:
+                best_model = copy.deepcopy(model)
+                best_bayesian_abr = bayesian_abr
+                best_iteration = 0
 
         # Step 2: Main loop - process new batches each period
         iterator = range(1, self.cfg.n_periods + 1)
@@ -146,69 +170,103 @@ class AcceptanceLoop:
             # Generate new batch of applicants this period
             batch = self.generator.generate_population(self.cfg.batch_size)
 
-            # Model makes accept/reject decisions (accept top α by predicted score)
-            batch_X = batch[feature_cols].values
-            batch_scores = model.predict_proba(batch_X)
-
-            # Accept those with lowest predicted bad rate (top α percentile)
-            threshold = np.percentile(batch_scores, alpha * 100)
-            accept_mask = batch_scores <= threshold
-
-            batch_accepts = batch[accept_mask].copy()
-            batch_rejects = batch[~accept_mask].copy()
+            # MAR acceptance: accept by feature x_v only (same rule as initial batch)
+            # Per paper Section 1.2 / Appendix C.2: acceptance depends on x_v, NOT model
+            # "Acceptance NEVER uses model outputs" - this rule is FIXED for all iterations
+            batch_accepts, batch_rejects = self._accept_by_feature(
+                batch, self.cfg.x_v_feature, alpha
+            )
 
             # Accumulate for final return
             all_accepts.append(batch_accepts)
             all_rejects.append(batch_rejects)
 
-            # Add new accepts to training data (observed labels)
+            # Add new accepts to cumulative accepts (true labels only)
             if len(batch_accepts) > 0:
                 new_X = batch_accepts[feature_cols].values
                 new_y = batch_accepts["y"].values
                 X_accepts = np.vstack([X_accepts, new_X])
                 y_accepts = np.concatenate([y_accepts, new_y])
-                X_labeled = np.vstack([X_labeled, new_X])
-                y_labeled = np.concatenate([y_labeled, new_y])
 
-            # Add new rejects to pool (for Bayesian eval and BASL)
+                # Update baseline model and LR calibrator on all accumulated accepts
+                # Per Section 4.3: prior comes from historical acceptance model
+                if baseline_model is not None:
+                    baseline_model.fit(X_accepts, y_accepts)
+                    baseline_scores = baseline_model.predict_proba(X_accepts).reshape(-1, 1)
+                    prior_calibrator.fit(baseline_scores, y_accepts)
+
+            # Add new rejects to cumulative reject set for evaluation
             if len(batch_rejects) > 0:
                 new_X_rejects = batch_rejects[feature_cols].values
-                if self.basl_trainer is not None:
-                    # Filter new rejects before adding to pool
-                    new_filtered = self.basl_trainer.filter_rejects_once(
-                        X_accepts, new_X_rejects
-                    )
-                    X_rejects_pool = np.vstack([X_rejects_pool, new_filtered])
-                else:
-                    X_rejects_pool = np.vstack([X_rejects_pool, new_X_rejects])
+                X_rejects_for_eval = np.vstack([X_rejects_for_eval, new_X_rejects])
 
-            # BASL mode: run pseudo-labeling iterations
-            if self.basl_trainer is not None and len(X_rejects_pool) > 0:
-                X_labeled, y_labeled, X_rejects_pool = self._run_basl_labeling(
-                    X_labeled, y_labeled, X_rejects_pool
+            # Train model for this iteration
+            # Per paper Algorithm C.2 and two-loop separation:
+            # - Baseline: train on accepts only (f_a)
+            # - BASL: run fresh on current D_a^(j), D_r^(j), pseudo-labels are ephemeral
+            if self.basl_trainer is not None:
+                # BASL mode: run fresh each iteration on current snapshot
+                # Filter the FULL current reject set (not an incrementally shrinking pool)
+                X_rejects_filtered = self.basl_trainer.filter_rejects_once(
+                    X_accepts, X_rejects_for_eval
                 )
 
-            # Retrain model on updated labeled set
-            model.fit(X_labeled, y_labeled)
+                if len(X_rejects_filtered) > 0:
+                    # Initialize local BASL state from accepts only (no carryover)
+                    X_basl = X_accepts.copy()
+                    y_basl = y_accepts.copy()
+
+                    # Run BASL pseudo-labeling on filtered rejects
+                    X_basl, y_basl, _ = self._run_basl_labeling(
+                        X_basl, y_basl, X_rejects_filtered.copy()
+                    )
+
+                    # Train BASL evaluation model on accepts + pseudo-labeled rejects
+                    model.fit(X_basl, y_basl)
+                    # Pseudo-labels are now discarded (not stored for next iteration)
+                else:
+                    # No filtered rejects available, train on accepts only
+                    model.fit(X_accepts, y_accepts)
+            else:
+                # Baseline mode: train only on true accepts (no pseudo-labels)
+                model.fit(X_accepts, y_accepts)
 
             # Track metrics at specified intervals
             should_track = (iteration % track_every == 0) or (iteration == self.cfg.n_periods)
 
             if should_track:
+                # Use X_rejects_for_eval (full D_r) for Bayesian evaluation
+                # This ensures baseline and BASL are evaluated on the same population
                 iteration_metrics = self._evaluate(
                     model,
                     X_accepts, y_accepts,
-                    X_rejects_pool,
+                    X_rejects_for_eval,
                     X_holdout, y_holdout,
-                    iteration
+                    iteration,
+                    baseline_model,
+                    prior_calibrator,
                 )
                 metrics_history.append(iteration_metrics)
+
+                # Track best model based on Bayesian ABR (Section 4.2 from paper)
+                if self.basl_trainer is not None:
+                    bayesian_abr = iteration_metrics['bayesian']['abr']
+                    if bayesian_abr < best_bayesian_abr:
+                        best_model = copy.deepcopy(model)
+                        best_bayesian_abr = bayesian_abr
+                        best_iteration = iteration
 
         # Combine all accepts/rejects for return
         D_a = pd.concat(all_accepts, ignore_index=True)
         D_r = pd.concat(all_rejects, ignore_index=True)
 
-        return D_a, D_r, holdout, model, metrics_history
+        # Return best model for BASL, last model for baseline (Section 4.3 from paper)
+        final_model = best_model if (self.basl_trainer is not None and best_model is not None) else model
+
+        if self.basl_trainer is not None and best_model is not None:
+            print(f"  BASL: Using best model from iteration {best_iteration} (Bayesian ABR={best_bayesian_abr:.4f})")
+
+        return D_a, D_r, holdout, final_model, metrics_history
 
     def _run_basl_labeling(
         self,
@@ -261,13 +319,27 @@ class AcceptanceLoop:
         X_holdout: np.ndarray,
         y_holdout: np.ndarray,
         iteration: int,
+        baseline_model: Optional[XGBoostModel] = None,
+        prior_calibrator: Optional[LogisticRegressionModel] = None,
     ) -> Dict[str, Any]:
         """Three-way evaluation for Figure 2.
+
+        CRITICAL: X_rejects must be the FULL reject population (D_r), NOT the
+        shrinking BASL labeling pool. Both baseline and BASL must evaluate on
+        the same reject set for fair comparison.
 
         Computes:
         - Oracle: Metrics on external holdout with true labels
         - Accepts: Metrics on accepts only (biased)
         - Bayesian: Metrics using MC pseudo-labeling (Algorithm 1)
+
+        Args:
+            X_rejects: Full reject population for Bayesian evaluation (must NOT
+                       be the BASL pool which shrinks during training).
+            baseline_model: Accepts-only XGBoost for generating prior scores (f_prior).
+                            ALWAYS provided - shared by baseline and BASL.
+            prior_calibrator: LR calibrator that maps XGBoost scores to probabilities.
+                              ALWAYS provided - part of f_prior pipeline.
         """
         metrics_list = ["auc", "pauc", "brier", "abr"]
         abr_range = self.bayesian_cfg.abr_range
@@ -278,16 +350,28 @@ class AcceptanceLoop:
             y_holdout, scores_holdout, metrics_list, abr_range=abr_range
         )
 
-        # Accepts-only: evaluate on internal holdout accepts only (biased)
+        # Accepts-only evaluation: evaluate on biased D_a population
+        # This shows the optimistically biased view from evaluating only on accepts.
+        # Per paper: Accepts ABR is intentionally biased low because rejects are missing.
         scores_accepts = model.predict_proba(X_accepts)
         accepts_metrics = compute_metrics(
             y_accepts, scores_accepts, metrics_list, abr_range=abr_range
         )
 
         # Bayesian: MC pseudo-labeling on internal holdout (Algorithm 1)
-        scores_rejects = (
-            model.predict_proba(X_rejects) if len(X_rejects) > 0 else np.array([])
-        )
+        # Per paper: f_eval scores are used for metrics, f_prior scores for pseudo-labeling
+        # - f_eval = model (the model being evaluated, differs between baseline/BASL)
+        # - f_prior = baseline XGBoost + LR calibrator (shared, always trained on accepts only)
+        if len(X_rejects) > 0:
+            # f_eval scores for rejects (used in metric computation)
+            eval_scores_rejects = model.predict_proba(X_rejects)
+
+            # f_prior scores for rejects (used for pseudo-label sampling)
+            raw_prior_scores = baseline_model.predict_proba(X_rejects)
+            prior_scores_rejects = prior_calibrator.predict_proba(raw_prior_scores.reshape(-1, 1))
+        else:
+            eval_scores_rejects = np.array([])
+            prior_scores_rejects = np.array([])
 
         # Use unique seed per iteration to ensure different MC samples
         iter_cfg = BayesianEvalConfig(
@@ -302,9 +386,10 @@ class AcceptanceLoop:
         )
 
         bayesian_result = bayesian_evaluate(
-            y_accepts, scores_accepts, scores_rejects,
+            y_accepts, scores_accepts, eval_scores_rejects,
             cfg=iter_cfg,
             metrics_list=metrics_list,
+            prior_scores_rejects=prior_scores_rejects,
         )
 
         # Extract mean values for consistency with other metrics

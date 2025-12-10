@@ -6,6 +6,11 @@ Runs acceptance loops with per-iteration metric tracking to generate:
 - Panels (a-d): Oracle vs Accepts-based vs Bayesian evaluation over iterations
 - Panel (e): Baseline vs BASL training comparison over iterations
 
+Also stores data for Figure 2 visualizations:
+- Panel (a): Feature distributions (accepts/rejects/population)
+- Panel (b): Surrogate model coefficients
+- Panel (c): Score distributions
+
 Usage:
     python scripts/run_experiment.py
     python scripts/run_experiment.py --seed 42 --track-every 10
@@ -27,6 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
+from sklearn.linear_model import LogisticRegression
 from tqdm import tqdm
 
 from src.config import (
@@ -39,8 +45,43 @@ from src.config import (
     SyntheticDataConfig,
     XGBoostConfig,
 )
+from src.evaluation.metrics import compute_metrics
 from src.io.synthetic_acceptance_loop import AcceptanceLoop
 from src.io.synthetic_generator import SyntheticGenerator
+from src.models.xgboost_model import XGBoostModel
+
+
+def compute_surrogate_coefficients(
+    model: XGBoostModel,
+    X: np.ndarray,
+    feature_names: list[str],
+) -> dict[str, float]:
+    """Fit logistic regression on XGBoost predictions as a surrogate model.
+
+    Per paper Figure 2(b), this gives interpretable coefficients to visualize
+    bias in model learned from accepts vs BASL vs oracle training.
+
+    Args:
+        model: Trained XGBoost model.
+        X: Feature matrix to get predictions on.
+        feature_names: Names of features for coefficient dict.
+
+    Returns:
+        Dict mapping feature name to coefficient (including intercept).
+    """
+    scores = model.predict_proba(X)
+    # Create pseudo-labels: threshold at 0.5 for binary classification
+    y_pseudo = (scores > 0.5).astype(int)
+
+    # Fit logistic regression on predictions
+    lr = LogisticRegression(solver='lbfgs', max_iter=1000)
+    lr.fit(X, y_pseudo)
+
+    coefficients = {"intercept": float(lr.intercept_[0])}
+    for name, coef in zip(feature_names, lr.coef_[0]):
+        coefficients[name] = float(coef)
+
+    return coefficients
 
 
 def set_seed_in_configs(
@@ -86,15 +127,19 @@ def run_trial(
     """Run a single trial with iteration tracking.
 
     Runs both baseline and BASL loops with the same holdout for fair comparison.
-    Returns iteration history for both.
+    Returns iteration history for both, plus data for Figure 2 visualizations.
     """
     data_cfg, model_cfg, loop_cfg, basl_cfg, bayesian_cfg = set_seed_in_configs(
         seed, data_cfg, model_cfg, loop_cfg, basl_cfg, bayesian_cfg
     )
 
+    feature_cols = [f"x{i}" for i in range(data_cfg.n_features)]
+
     # Generate holdout once for both loops (ensures fair comparison)
     generator_holdout = SyntheticGenerator(data_cfg)
     holdout = generator_holdout.generate_holdout()
+    X_holdout = holdout[feature_cols].values
+    y_holdout = holdout["y"].values
 
     if show_progress:
         tqdm.write(f"  Seed {seed}: Running baseline loop...")
@@ -116,6 +161,52 @@ def run_trial(
         holdout=holdout, track_every=track_every, show_progress=show_progress
     )
 
+    # Train an oracle model on D_a ∪ D_r with true labels (per paper Algorithm C.2)
+    if show_progress:
+        tqdm.write(f"  Seed {seed}: Training oracle model...")
+
+    # Combine accepts and rejects from baseline loop
+    X_oracle = np.vstack([
+        D_a_base[feature_cols].values,
+        D_r_base[feature_cols].values
+    ])
+    y_oracle = np.hstack([
+        D_a_base["y"].values,
+        D_r_base["y"].values
+    ])
+
+    oracle_model = XGBoostModel(model_cfg)
+    oracle_model.fit(X_oracle, y_oracle)
+
+    # Compute surrogate model coefficients for Figure 2(b)
+    baseline_coeffs = compute_surrogate_coefficients(baseline_model, X_holdout, feature_cols)
+    basl_coeffs = compute_surrogate_coefficients(basl_model, X_holdout, feature_cols)
+    oracle_coeffs = compute_surrogate_coefficients(oracle_model, X_holdout, feature_cols)
+
+    # Compute score distributions for Figure 2(c)
+    scores_baseline = baseline_model.predict_proba(X_holdout).tolist()
+    scores_basl = basl_model.predict_proba(X_holdout).tolist()
+    scores_oracle = oracle_model.predict_proba(X_holdout).tolist()
+
+    # Compute Oracle model metrics for Figure 2(e) reference line
+    oracle_metrics = compute_metrics(
+        y_holdout, np.array(scores_oracle),
+        ["auc", "pauc", "brier", "abr"],
+        abr_range=bayesian_cfg.abr_range
+    )
+
+    # Store feature distributions for Figure 2(a)
+    # Use a subset of features to keep file size manageable
+    X_accepts = D_a_base[feature_cols].values
+    X_rejects = D_r_base[feature_cols].values
+
+    # Sample features for KDE (store x0 and x1 for 2D case)
+    n_sample = min(1000, len(X_accepts), len(X_rejects), len(X_holdout))
+    rng = np.random.default_rng(seed)
+    idx_accepts = rng.choice(len(X_accepts), size=min(n_sample, len(X_accepts)), replace=False)
+    idx_rejects = rng.choice(len(X_rejects), size=min(n_sample, len(X_rejects)), replace=False)
+    idx_holdout = rng.choice(len(X_holdout), size=min(n_sample, len(X_holdout)), replace=False)
+
     return {
         "seed": seed,
         "baseline_history": baseline_history,
@@ -125,6 +216,29 @@ def run_trial(
         "n_accepts_basl": len(D_a_basl),
         "n_rejects_basl": len(D_r_basl),
         "holdout_bad_rate": float(holdout["y"].mean()),
+        # Figure 2(a) data: feature distributions
+        "feature_distributions": {
+            "accepts_x0": X_accepts[idx_accepts, 0].tolist(),
+            "accepts_x1": X_accepts[idx_accepts, 1].tolist() if data_cfg.n_features > 1 else [],
+            "rejects_x0": X_rejects[idx_rejects, 0].tolist(),
+            "rejects_x1": X_rejects[idx_rejects, 1].tolist() if data_cfg.n_features > 1 else [],
+            "population_x0": X_holdout[idx_holdout, 0].tolist(),
+            "population_x1": X_holdout[idx_holdout, 1].tolist() if data_cfg.n_features > 1 else [],
+        },
+        # Figure 2(b) data: surrogate model coefficients
+        "surrogate_coefficients": {
+            "baseline": baseline_coeffs,
+            "basl": basl_coeffs,
+            "oracle": oracle_coeffs,
+        },
+        # Figure 2(c) data: score distributions (sampled)
+        "score_distributions": {
+            "baseline": [scores_baseline[i] for i in idx_holdout],
+            "basl": [scores_basl[i] for i in idx_holdout],
+            "oracle": [scores_oracle[i] for i in idx_holdout],
+        },
+        # Figure 2(e) data: Oracle model metrics (trained on full population)
+        "oracle_metrics": oracle_metrics,
     }
 
 
