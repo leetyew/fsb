@@ -1,0 +1,44 @@
+# Experiment I: Reliability of Bayesian Evaluation (Figure 2)
+# Per docs/experiments.md Section 1 and docs/hyperparameters.md
+#
+# Uses AcceptanceLoop: 500 periods × 100 applicants per batch
+# All scorecards (f_a, f_o) are XGBoost per Appendix E.1
+
+synthetic_data:
+  n_features: 2        # 1 informative (x0) + 1 noise
+  n_components: 2      # Good/bad borrower distributions
+  bad_rate: 0.70       # 70% bad rate per paper Section 3.1
+  n_holdout: 3000      # Per paper Algorithm C.2
+
+acceptance_loop:
+  n_periods: 500       # j_max = 500 iterations
+  batch_size: 100      # n = 100 applicants per period
+  initial_batch_size: 100
+  target_accept_rate: 0.15  # alpha = 0.15
+  x_v_feature: "x_v"   # Bureau score: x_v = -x0 (higher = lower risk)
+
+xgboost:
+  n_estimators: 100
+  max_depth: 3
+  learning_rate: 0.1
+
+bayesian:
+  n_bands: 10
+  j_min: 100
+  j_max: 10000         # Per hyperparameters.md: >=10k draws
+  epsilon: 1.0e-6
+  prior_alpha: 1.0
+  prior_beta: 1.0
+  use_banding: false
+  abr_range: [0.2, 0.4]  # ABR integrated over range per paper
+
+logistic_regression:
+  # Used ONLY for Bayesian prior calibration, not as scorecard
+  C: 1.0
+  penalty: "l2"
+  solver: "lbfgs"
+
+experiment:
+  n_seeds: 10
+  start_seed: 42
+  track_every: 50      # Record metrics every 50 iterations for Figure 2

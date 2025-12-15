@@ -57,12 +57,34 @@ class AcceptanceLoop:
         # BASL trainer only if config provided
         self.basl_trainer = BASLTrainer(basl_cfg) if basl_cfg is not None else None
 
+    def _add_bureau_score(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add bureau-like score column x_v based on the raw synthetic x0.
+
+        Per paper Appendix E.1, bad borrowers have higher x0 than good borrowers.
+        We define x_v = -x0 so that:
+          - good borrowers (lower x0) get higher x_v (better score)
+          - bad borrowers (higher x0) get lower x_v (worse score)
+
+        This keeps the generator faithful to Appendix E.1 while making
+        'highest x_v' correspond to lowest risk, matching Algorithm C.2.
+        """
+        df = df.copy()
+        df["x_v"] = -df["x0"]
+        return df
+
     def _accept_by_feature(
         self, df: pd.DataFrame, feature: str, accept_rate: float
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Accept top α percentile by feature value (lower = lower risk)."""
-        threshold = np.percentile(df[feature], accept_rate * 100)
-        accept_mask = df[feature] <= threshold
+        """Accept top α percentile by score (higher x_v = lower risk).
+
+        Per Algorithm C.2:
+          - τ is the (1-α)-th percentile of x_v (e.g. 85th percentile for α=0.15)
+          - D_a = { (X_i, y_i): x_{i,v} >= τ }  (top α fraction by score)
+          - D_r = { (X_i, y_i): x_{i,v} <  τ }
+        """
+        # For α=0.15, compute 85th percentile threshold
+        threshold = np.percentile(df[feature], (1 - accept_rate) * 100)
+        accept_mask = df[feature] >= threshold
         return df[accept_mask].copy(), df[~accept_mask].copy()
 
     def run(
@@ -97,6 +119,8 @@ class AcceptanceLoop:
 
         # Step 1: Generate initial batch and accept by feature (no model yet)
         initial_batch = self.generator.generate_population(self.cfg.initial_batch_size)
+        # Add bureau score x_v = -x0 for paper-faithful acceptance
+        initial_batch = self._add_bureau_score(initial_batch)
         initial_accepts, initial_rejects = self._accept_by_feature(
             initial_batch, self.cfg.x_v_feature, alpha
         )
@@ -113,10 +137,19 @@ class AcceptanceLoop:
         # X_rejects_for_eval: cumulative rejects for Bayesian evaluation
         # This is the full D_r^(j) used for evaluation, grows each iteration
         X_rejects_for_eval = initial_rejects[feature_cols].values
+        # y_rejects_true: true labels for rejects (for oracle training in simulation)
+        y_rejects_true = initial_rejects["y"].values
 
-        # Initialize model on first accepts
+        # Initialize model on first accepts (f_a: accepts-based scorecard)
         model = XGBoostModel(self.model_cfg)
         model.fit(X_accepts, y_accepts)
+
+        # Initialize oracle model (f_o: trained on D_a ∪ D_r with true labels)
+        # Per Algorithm C.2: f_o is the benchmark that has access to all true labels
+        oracle_model = XGBoostModel(self.model_cfg)
+        X_all = np.vstack([X_accepts, X_rejects_for_eval])
+        y_all = np.concatenate([y_accepts, y_rejects_true])
+        oracle_model.fit(X_all, y_all)
 
         # ALWAYS create f_prior (baseline XGBoost + LR calibrator) for Bayesian evaluation
         # Per paper Section 4.3: f_prior is SHARED by ALL methods (baseline and BASL)
@@ -144,6 +177,7 @@ class AcceptanceLoop:
         # Use X_rejects_for_eval (full D_r) for Bayesian evaluation, NOT the BASL pool
         initial_metrics = self._evaluate(
             model,
+            oracle_model,
             X_accepts, y_accepts,
             X_rejects_for_eval,
             X_holdout, y_holdout,
@@ -169,6 +203,8 @@ class AcceptanceLoop:
         for iteration in iterator:
             # Generate new batch of applicants this period
             batch = self.generator.generate_population(self.cfg.batch_size)
+            # Add bureau score x_v = -x0 for paper-faithful acceptance
+            batch = self._add_bureau_score(batch)
 
             # MAR acceptance: accept by feature x_v only (same rule as initial batch)
             # Per paper Section 1.2 / Appendix C.2: acceptance depends on x_v, NOT model
@@ -198,7 +234,15 @@ class AcceptanceLoop:
             # Add new rejects to cumulative reject set for evaluation
             if len(batch_rejects) > 0:
                 new_X_rejects = batch_rejects[feature_cols].values
+                new_y_rejects = batch_rejects["y"].values
                 X_rejects_for_eval = np.vstack([X_rejects_for_eval, new_X_rejects])
+                y_rejects_true = np.concatenate([y_rejects_true, new_y_rejects])
+
+            # Train oracle model on D_a ∪ D_r with true labels (per Algorithm C.2)
+            # f_o represents the benchmark with access to all true labels
+            X_all = np.vstack([X_accepts, X_rejects_for_eval])
+            y_all = np.concatenate([y_accepts, y_rejects_true])
+            oracle_model.fit(X_all, y_all)
 
             # Train model for this iteration
             # Per paper Algorithm C.2 and two-loop separation:
@@ -239,6 +283,7 @@ class AcceptanceLoop:
                 # This ensures baseline and BASL are evaluated on the same population
                 iteration_metrics = self._evaluate(
                     model,
+                    oracle_model,
                     X_accepts, y_accepts,
                     X_rejects_for_eval,
                     X_holdout, y_holdout,
@@ -313,6 +358,7 @@ class AcceptanceLoop:
     def _evaluate(
         self,
         model: XGBoostModel,
+        oracle_model: XGBoostModel,
         X_accepts: np.ndarray,
         y_accepts: np.ndarray,
         X_rejects: np.ndarray,
@@ -322,18 +368,21 @@ class AcceptanceLoop:
         baseline_model: Optional[XGBoostModel] = None,
         prior_calibrator: Optional[LogisticRegressionModel] = None,
     ) -> Dict[str, Any]:
-        """Three-way evaluation for Figure 2.
+        """Four-way evaluation for Figures 2-4.
 
         CRITICAL: X_rejects must be the FULL reject population (D_r), NOT the
         shrinking BASL labeling pool. Both baseline and BASL must evaluate on
         the same reject set for fair comparison.
 
         Computes:
-        - Oracle: Metrics on external holdout with true labels
-        - Accepts: Metrics on accepts only (biased)
-        - Bayesian: Metrics using MC pseudo-labeling (Algorithm 1)
+        - Oracle: f_o (trained on D_a ∪ D_r) metrics on external holdout
+        - Model: f_a/f_c (accepts-based or BASL) metrics on holdout
+        - Accepts: f_a/f_c metrics on accepts only (biased)
+        - Bayesian: f_a/f_c metrics using MC pseudo-labeling (Algorithm 1)
 
         Args:
+            model: The model being evaluated (f_a for baseline, f_c for BASL).
+            oracle_model: f_o trained on D_a ∪ D_r with true labels.
             X_rejects: Full reject population for Bayesian evaluation (must NOT
                        be the BASL pool which shrinks during training).
             baseline_model: Accepts-only XGBoost for generating prior scores (f_prior).
@@ -344,10 +393,18 @@ class AcceptanceLoop:
         metrics_list = ["auc", "pauc", "brier", "abr"]
         abr_range = self.bayesian_cfg.abr_range
 
-        # Oracle: evaluate on external holdout with true labels
-        scores_holdout = model.predict_proba(X_holdout)
+        # Oracle model (f_o): evaluate on external holdout with true labels
+        # Per Algorithm C.2: f_o is trained on D_a ∪ D_r and represents the benchmark
+        oracle_scores_holdout = oracle_model.predict_proba(X_holdout)
         oracle_metrics = compute_metrics(
-            y_holdout, scores_holdout, metrics_list, abr_range=abr_range
+            y_holdout, oracle_scores_holdout, metrics_list, abr_range=abr_range
+        )
+
+        # Model (f_a/f_c): evaluate on external holdout with true labels
+        # This shows how the accepts-based or BASL model performs on unbiased data
+        model_scores_holdout = model.predict_proba(X_holdout)
+        model_holdout_metrics = compute_metrics(
+            y_holdout, model_scores_holdout, metrics_list, abr_range=abr_range
         )
 
         # Accepts-only evaluation: evaluate on biased D_a population
@@ -400,8 +457,9 @@ class AcceptanceLoop:
 
         return {
             "iteration": iteration,
-            "oracle": oracle_metrics,
-            "accepts": accepts_metrics,
-            "bayesian": bayesian_metrics,
-            "bayesian_full": bayesian_result,  # Include full posterior stats
+            "oracle": oracle_metrics,           # f_o on holdout (benchmark)
+            "model_holdout": model_holdout_metrics,  # f_a/f_c on holdout
+            "accepts": accepts_metrics,         # f_a/f_c on accepts only (biased)
+            "bayesian": bayesian_metrics,       # Bayesian estimate
+            "bayesian_full": bayesian_result,   # Include full posterior stats
         }

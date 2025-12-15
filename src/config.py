@@ -97,7 +97,7 @@ class AcceptanceLoopConfig(BaseModel):
     batch_size: int = 100
     target_accept_rate: float = 0.15  # α
     initial_batch_size: int = 100
-    x_v_feature: str = "x0"  # Feature for initial acceptance (before model exists)
+    x_v_feature: str = "x_v"  # Bureau score: x_v = -x0 (higher = lower risk)
     random_seed: int = 42
 
     @classmethod

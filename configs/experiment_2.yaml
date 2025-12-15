@@ -1,0 +1,46 @@
+# Experiment II: BASL Training Effectiveness (Figures 3-4, Table 2)
+# Per docs/experiments.md Section 2 and docs/hyperparameters.md
+#
+# Uses AcceptanceLoop: 500 periods × 100 applicants per batch
+# All scorecards (f_a, f_o, f_c) are XGBoost per Appendix E.1
+# LR used ONLY for BASL weak learner (pseudo-labeling)
+#
+# CRITICAL: BASL pseudo-labels are ephemeral and discarded each iteration
+
+synthetic_data:
+  n_features: 2        # 1 informative (x0) + 1 noise
+  n_components: 2      # Good/bad borrower distributions
+  bad_rate: 0.70       # 70% bad rate per paper Section 3.1
+  n_holdout: 3000      # Per paper Algorithm C.2
+
+acceptance_loop:
+  n_periods: 500       # j_max = 500 iterations
+  batch_size: 100      # n = 100 applicants per period
+  initial_batch_size: 100
+  target_accept_rate: 0.15  # alpha = 0.15
+  x_v_feature: "x_v"   # Bureau score: x_v = -x0 (higher = lower risk)
+
+basl:
+  filter_proportion: 0.15  # rho = 0.1-0.3, default ~0.15
+  max_iterations: 1        # Single iteration per period (pseudo-labels discarded)
+  pseudo_threshold: 0.5
+
+xgboost:
+  n_estimators: 100
+  max_depth: 3
+  learning_rate: 0.1
+
+logistic_regression:
+  # Used ONLY for BASL weak learner, not as scorecard
+  C: 1.0
+  penalty: "l2"
+  solver: "lbfgs"
+
+evaluation:
+  abr_range: [0.2, 0.4]  # ABR integrated over range per paper
+  n_bins: 10             # For Figure 4 feature bias analysis
+
+experiment:
+  n_seeds: 10
+  start_seed: 42
+  track_every: 50        # Record metrics every 50 iterations for Figures 3-4
