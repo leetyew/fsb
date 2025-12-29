@@ -91,6 +91,10 @@ class AcceptanceLoopConfig(BaseModel):
     - Runs for all n_periods without early stopping
     - All accepts (D^a) used for training
     - Separate external holdout for oracle evaluation
+
+    Acceptance modes:
+    - "feature": Use x_v feature threshold (for Exp I - evaluation experiments)
+    - "model": Use f_a(X) model scores after first batch (for Exp II - BASL dynamics)
     """
 
     n_periods: int = 500
@@ -98,6 +102,7 @@ class AcceptanceLoopConfig(BaseModel):
     target_accept_rate: float = 0.15  # α
     initial_batch_size: int = 100
     x_v_feature: str = "x_v"  # Bureau score: x_v = -x0 (higher = lower risk)
+    acceptance_mode: str = "feature"  # "feature" for Exp I, "model" for Exp II
     random_seed: int = 42
 
     @classmethod

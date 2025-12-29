@@ -16,6 +16,7 @@ acceptance_loop:
   initial_batch_size: 100
   target_accept_rate: 0.15  # alpha = 0.15
   x_v_feature: "x_v"   # Bureau score: x_v = -x0 (higher = lower risk)
+  acceptance_mode: "feature"  # Feature-based for Exp I (cleanly isolates bias)
 
 xgboost:
   n_estimators: 100

@@ -43,6 +43,7 @@ from src.config import (
 )
 from src.io.synthetic_acceptance_loop import AcceptanceLoop
 from src.io.synthetic_generator import SyntheticGenerator
+from src.models.logistic_regression import LogisticRegressionConfig, LogisticRegressionModel
 
 
 # Global config loaded from YAML
@@ -56,6 +57,94 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
 
     with open(config_path) as f:
         return yaml.safe_load(f)
+
+
+def collect_figure2_data(
+    D_a: Any,
+    D_r: Any,
+    holdout: Any,
+    model: Any,
+    oracle_model: Any,
+    generator: SyntheticGenerator,
+    feature_cols: list[str],
+) -> dict[str, Any]:
+    """Collect data for Figure 2 panels (a), (b), (c) - Experiment I diagnostic data.
+
+    Panel (a): Feature distributions (population, accepts, rejects)
+    Panel (b): LR coefficients (accepts-only vs oracle) - 2 features only
+    Panel (c): LR score distributions (accepts-only vs oracle) - 2 features only
+
+    Note: BASL models are NOT included in Experiment I. They come from Experiment II.
+
+    Args:
+        D_a: Accepts dataframe with features and labels
+        D_r: Rejects dataframe with features and labels
+        holdout: Holdout dataframe
+        model: Accepts-only model (XGBoost) - not used for panels b,c
+        oracle_model: Oracle model (XGBoost) - not used for panels b,c
+        generator: Data generator for population sample
+        feature_cols: List of feature column names
+
+    Returns:
+        Dictionary with Figure 2 panel data
+    """
+    # Panel (a): Feature distributions
+    # Sample from population for comparison
+    population_sample = generator.generate_population(n_samples=3000)
+
+    panel_a_data = {
+        "population_x0": population_sample["x0"].tolist(),
+        "accepts_x0": D_a["x0"].tolist(),
+        "rejects_x0": D_r["x0"].tolist(),
+    }
+
+    # Panel (b): Model coefficients using 2-feature Logistic Regression
+    # Paper uses ONLY x0 and x1 for interpretability
+    lr_feature_cols = ["x0", "x1"]
+    X_a = D_a[lr_feature_cols].values
+    y_a = D_a["y"].values
+    X_r = D_r[lr_feature_cols].values
+    y_r = D_r["y"].values
+
+    lr_cfg = LogisticRegressionConfig(C=1.0, penalty="l2", solver="lbfgs")
+
+    # Accepts-only LR model (2 features)
+    lr_accepts = LogisticRegressionModel(lr_cfg)
+    lr_accepts.fit(X_a, y_a)
+
+    # Oracle LR model (2 features, trained on full data)
+    lr_oracle = LogisticRegressionModel(lr_cfg)
+    X_all = np.vstack([X_a, X_r])
+    y_all = np.concatenate([y_a, y_r])
+    lr_oracle.fit(X_all, y_all)
+
+    # Extract coefficients: [x0_coef, x1_coef] + intercept
+    # Paper labels: N1 (x0), N2 (x1), Intercept
+    panel_b_data = {
+        "feature_names": ["N1", "N2", "Intercept"],  # Paper labels
+        "lr_features": lr_feature_cols,  # Actual features used
+        "accepts_coefficients": lr_accepts._model.coef_[0].tolist(),
+        "accepts_intercept": float(lr_accepts._model.intercept_[0]),
+        "oracle_coefficients": lr_oracle._model.coef_[0].tolist(),
+        "oracle_intercept": float(lr_oracle._model.intercept_[0]),
+    }
+
+    # Panel (c): LR score distributions on holdout
+    X_holdout = holdout[lr_feature_cols].values
+
+    accepts_scores_lr = lr_accepts.predict_proba(X_holdout)
+    oracle_scores_lr = lr_oracle.predict_proba(X_holdout)
+
+    panel_c_data = {
+        "accepts_scores": accepts_scores_lr.tolist(),
+        "oracle_scores": oracle_scores_lr.tolist(),
+    }
+
+    return {
+        "panel_a": panel_a_data,
+        "panel_b": panel_b_data,
+        "panel_c": panel_c_data,
+    }
 
 
 def run_trial(seed: int) -> dict[str, Any]:
@@ -122,10 +211,22 @@ def run_trial(seed: int) -> dict[str, Any]:
     )
 
     track_every = CONFIG["experiment"].get("track_every", 50)
-    D_a, D_r, holdout, model, metrics_history = loop.run(
+    D_a, D_r, holdout, model, oracle_model, metrics_history = loop.run(
         holdout=holdout,
         track_every=track_every,
         show_progress=False,
+    )
+
+    # Collect Figure 2 panel data (a, b, c)
+    feature_cols = [f"x{i}" for i in range(data_cfg.n_features)]
+    figure2_data = collect_figure2_data(
+        D_a=D_a,
+        D_r=D_r,
+        holdout=holdout,
+        model=model,
+        oracle_model=oracle_model,
+        generator=generator,
+        feature_cols=feature_cols,
     )
 
     # Extract final metrics for summary
@@ -153,8 +254,10 @@ def run_trial(seed: int) -> dict[str, Any]:
         "bayesian_auc": final_metrics["bayesian"]["auc"],
         "bayesian_abr": final_metrics["bayesian"]["abr"],
         "bayesian_abr_bias": final_metrics["bayesian"]["abr"] - final_metrics["oracle"]["abr"],
-        # Full metrics history for Figure 2
+        # Full metrics history for Figure 2 panel (d)
         "metrics_history": metrics_history,
+        # Figure 2 panel data (a, b, c)
+        "figure2_data": figure2_data,
     }
 
 
@@ -219,16 +322,24 @@ def main():
         trial = run_trial(seed)
         trials.append(trial)
 
-        # Save individual trial (without metrics_history for summary)
-        trial_summary = {k: v for k, v in trial.items() if k != "metrics_history"}
+        # Save individual trial (without large nested data for summary)
+        trial_summary = {
+            k: v for k, v in trial.items()
+            if k not in ["metrics_history", "figure2_data"]
+        }
         trial_path = exp_dir / f"trial_seed{seed}.json"
         with open(trial_path, "w") as f:
             json.dump(trial_summary, f, indent=2)
 
-        # Save full metrics history separately for Figure 2
+        # Save full metrics history separately for Figure 2 panel (d)
         history_path = exp_dir / f"metrics_history_seed{seed}.json"
         with open(history_path, "w") as f:
             json.dump(trial["metrics_history"], f, indent=2)
+
+        # Save Figure 2 panel data (a, b, c) separately
+        figure2_path = exp_dir / f"figure2_data_seed{seed}.json"
+        with open(figure2_path, "w") as f:
+            json.dump(trial["figure2_data"], f, indent=2)
 
     # Aggregate results (final iteration)
     aggregated = {
@@ -267,7 +378,8 @@ def main():
     print(f"    Bias:                {aggregated['bayesian_abr_bias_mean']:+.4f} +/- {aggregated['bayesian_abr_bias_std']:.4f}")
     print("=" * 70)
     print(f"\nResults saved to: {exp_dir}")
-    print(f"  - Per-iteration metrics: metrics_history_seed*.json")
+    print(f"  - Per-iteration metrics (Fig 2d): metrics_history_seed*.json")
+    print(f"  - Figure 2 panel data (a,b,c): figure2_data_seed*.json")
     print(f"  - Trial summaries: trial_seed*.json")
     print(f"  - Aggregated: aggregated.json")
 

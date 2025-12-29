@@ -87,12 +87,34 @@ class AcceptanceLoop:
         accept_mask = df[feature] >= threshold
         return df[accept_mask].copy(), df[~accept_mask].copy()
 
+    def _accept_by_model(
+        self, df: pd.DataFrame, model: XGBoostModel, accept_rate: float, feature_cols: list
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Accept top α percentile by model scores (lower P(bad) = accept).
+
+        Per Algorithm C.2 for model-based acceptance (Exp II):
+          - τ is the α-th percentile of f_a(X) scores (accept lowest risk)
+          - D_a = { (X_i, y_i): f_a(X_i) <= τ }  (lowest α fraction by risk score)
+          - D_r = { (X_i, y_i): f_a(X_i) >  τ }
+
+        This creates the feedback loop where model predictions drive acceptance,
+        required to see compounding bias and BASL correction effects.
+        """
+        # Get model scores (P(bad))
+        X = df[feature_cols].values
+        scores = model.predict_proba(X)
+
+        # For α=0.15, accept the 15% with lowest P(bad) (highest quality)
+        threshold = np.percentile(scores, accept_rate * 100)
+        accept_mask = scores <= threshold
+        return df[accept_mask].copy(), df[~accept_mask].copy()
+
     def run(
         self,
         holdout: pd.DataFrame,
         track_every: int = 1,
         show_progress: bool = True,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, XGBoostModel, List[Dict[str, Any]]]:
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, XGBoostModel, XGBoostModel, List[Dict[str, Any]]]:
         """Run the integrated training and evaluation loop per Algorithm C.2.
 
         Per paper Section 6.1:
@@ -107,7 +129,7 @@ class AcceptanceLoop:
             show_progress: Whether to show tqdm progress bar.
 
         Returns:
-            (D_a, D_r, holdout, model, metrics_history)
+            (D_a, D_r, holdout, model, oracle_model, metrics_history)
             where metrics_history contains oracle/accepts/bayesian metrics per iteration
         """
         feature_cols = [f"x{i}" for i in range(self.generator.cfg.n_features)]
@@ -206,12 +228,19 @@ class AcceptanceLoop:
             # Add bureau score x_v = -x0 for paper-faithful acceptance
             batch = self._add_bureau_score(batch)
 
-            # MAR acceptance: accept by feature x_v only (same rule as initial batch)
-            # Per paper Section 1.2 / Appendix C.2: acceptance depends on x_v, NOT model
-            # "Acceptance NEVER uses model outputs" - this rule is FIXED for all iterations
-            batch_accepts, batch_rejects = self._accept_by_feature(
-                batch, self.cfg.x_v_feature, alpha
-            )
+            # Acceptance decision based on configured mode
+            if self.cfg.acceptance_mode == "model":
+                # Model-based acceptance (Exp II / Algorithm C.2 feedback loop)
+                # Accept based on f_a(X) scores - creates compounding bias
+                batch_accepts, batch_rejects = self._accept_by_model(
+                    batch, model, alpha, feature_cols
+                )
+            else:
+                # Feature-based acceptance (Exp I / MAR setting)
+                # Accept by x_v feature only - cleanly isolates sampling bias
+                batch_accepts, batch_rejects = self._accept_by_feature(
+                    batch, self.cfg.x_v_feature, alpha
+                )
 
             # Accumulate for final return
             all_accepts.append(batch_accepts)
@@ -311,7 +340,7 @@ class AcceptanceLoop:
         if self.basl_trainer is not None and best_model is not None:
             print(f"  BASL: Using best model from iteration {best_iteration} (Bayesian ABR={best_bayesian_abr:.4f})")
 
-        return D_a, D_r, holdout, final_model, metrics_history
+        return D_a, D_r, holdout, final_model, oracle_model, metrics_history
 
     def _run_basl_labeling(
         self,
@@ -402,18 +431,20 @@ class AcceptanceLoop:
 
         # Model (f_a/f_c): evaluate on external holdout with true labels
         # This shows how the accepts-based or BASL model performs on unbiased data
+        # Per paper: this is the "accepts-only ABR" for fair comparison with oracle
         model_scores_holdout = model.predict_proba(X_holdout)
         model_holdout_metrics = compute_metrics(
             y_holdout, model_scores_holdout, metrics_list, abr_range=abr_range
         )
 
-        # Accepts-only evaluation: evaluate on biased D_a population
-        # This shows the optimistically biased view from evaluating only on accepts.
-        # Per paper: Accepts ABR is intentionally biased low because rejects are missing.
+        # Accepts-only evaluation: evaluate accepts model on HOLDOUT (not D_a)
+        # Per paper definition: "ABR is average bad rate among accepts at 20-40% acceptance"
+        # This shows how the biased model ranks unbiased data (same population as oracle)
+        # Note: This is identical to model_holdout_metrics but named for paper terminology
+        accepts_metrics = model_holdout_metrics
+
+        # Compute model scores on accepts (needed for Bayesian evaluation)
         scores_accepts = model.predict_proba(X_accepts)
-        accepts_metrics = compute_metrics(
-            y_accepts, scores_accepts, metrics_list, abr_range=abr_range
-        )
 
         # Bayesian: MC pseudo-labeling on internal holdout (Algorithm 1)
         # Per paper: f_eval scores are used for metrics, f_prior scores for pseudo-labeling

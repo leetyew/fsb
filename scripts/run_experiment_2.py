@@ -49,6 +49,9 @@ from src.config import (
 from src.evaluation.metrics import compute_metrics
 from src.io.synthetic_acceptance_loop import AcceptanceLoop
 from src.io.synthetic_generator import SyntheticGenerator
+from src.models.logistic_regression import LogisticRegressionConfig, LogisticRegressionModel
+from src.models.xgboost_model import XGBoostModel
+from src.basl.labeling import label_rejects_iteration
 
 
 # Global config loaded from YAML
@@ -62,6 +65,83 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
 
     with open(config_path) as f:
         return yaml.safe_load(f)
+
+
+def train_basl_lr_for_diagnostics(
+    D_a: Any,
+    D_r: Any,
+    holdout: Any,
+    basl_cfg: BASLConfig,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Train BASL-LR model for Figure 2(b) and (c) diagnostic panels.
+
+    This is a simplified BASL run using 2-feature LR for interpretability.
+    It follows the same BASL algorithm but with LR instead of XGBoost.
+
+    Args:
+        D_a: Accepts dataframe
+        D_r: Rejects dataframe
+        holdout: Holdout dataframe
+        basl_cfg: BASL configuration
+        seed: Random seed
+
+    Returns:
+        Dictionary with BASL-LR coefficients and scores
+    """
+    lr_feature_cols = ["x0", "x1"]
+    X_a = D_a[lr_feature_cols].values
+    y_a = D_a["y"].values
+    X_r = D_r[lr_feature_cols].values
+
+    # Run BASL pseudo-labeling on rejects (using 2 features)
+    lr_cfg = LogisticRegressionConfig(C=1.0, penalty="l2", solver="lbfgs")
+    rng = np.random.default_rng(seed)
+
+    # Iteratively pseudo-label rejects using BASL labeling
+    X_labeled = X_a.copy()
+    y_labeled = y_a.copy()
+    X_rejects_pool = X_r.copy()
+
+    # Run multiple iterations of pseudo-labeling
+    for _ in range(basl_cfg.max_iterations):
+        if len(X_rejects_pool) == 0:
+            break
+
+        X_pseudo, y_pseudo, remaining_mask, _ = label_rejects_iteration(
+            X_labeled=X_labeled,
+            y_labeled=y_labeled,
+            X_rejects_pool=X_rejects_pool,
+            cfg=basl_cfg.labeling,
+            rng=rng,
+        )
+
+        if len(X_pseudo) == 0:
+            break
+
+        # Add pseudo-labeled to labeled set
+        X_labeled = np.vstack([X_labeled, X_pseudo])
+        y_labeled = np.concatenate([y_labeled, y_pseudo])
+
+        # Update remaining rejects pool
+        X_rejects_pool = X_rejects_pool[remaining_mask]
+
+    # Train BASL-LR on final augmented dataset
+    basl_lr = LogisticRegressionModel(lr_cfg)
+    basl_lr.fit(X_labeled, y_labeled)
+
+    # Get scores on holdout
+    X_holdout = holdout[lr_feature_cols].values
+    basl_scores = basl_lr.predict_proba(X_holdout)
+
+    return {
+        "feature_names": ["N1", "N2", "Intercept"],
+        "lr_features": lr_feature_cols,
+        "basl_coefficients": basl_lr._model.coef_[0].tolist(),
+        "basl_intercept": float(basl_lr._model.intercept_[0]),
+        "basl_scores": basl_scores.tolist(),
+        "n_pseudo_labeled": int(len(X_labeled) - len(X_a)),
+    }
 
 
 def compute_feature_bias_analysis(
@@ -192,7 +272,7 @@ def run_trial(seed: int) -> dict[str, Any]:
     )
 
     track_every = CONFIG["experiment"].get("track_every", 50)
-    D_a, D_r, holdout, model, metrics_history = loop.run(
+    D_a, D_r, holdout, model, oracle_model, metrics_history = loop.run(
         holdout=holdout,
         track_every=track_every,
         show_progress=False,
@@ -223,16 +303,25 @@ def run_trial(seed: int) -> dict[str, Any]:
     # Compute feature bias analysis for Figure 4
     # Note: We need the oracle model from the loop - it's tracked in metrics_history
     # For now, train it here for the feature bias analysis
-    oracle_model = XGBoostModel(model_cfg)
+    oracle_model_xgb = XGBoostModel(model_cfg)
     X_rejects = D_r[feature_cols].values
     y_rejects = D_r["y"].values
     X_all = np.vstack([X_accepts, X_rejects])
     y_all = np.hstack([y_accepts, y_rejects])
-    oracle_model.fit(X_all, y_all)
+    oracle_model_xgb.fit(X_all, y_all)
 
     n_bins = CONFIG["evaluation"].get("n_bins", 10)
     feature_bias = compute_feature_bias_analysis(
-        model, oracle_model, holdout, feature_cols, n_bins
+        model, oracle_model_xgb, holdout, feature_cols, n_bins
+    )
+
+    # Train BASL-LR for Figure 2(b) and (c) bridge panels
+    basl_lr_data = train_basl_lr_for_diagnostics(
+        D_a=D_a,
+        D_r=D_r,
+        holdout=holdout,
+        basl_cfg=basl_cfg,
+        seed=seed,
     )
 
     return {
@@ -256,6 +345,8 @@ def run_trial(seed: int) -> dict[str, Any]:
         "metrics_history": metrics_history,
         # Feature bias analysis for Figure 4
         "feature_bias_analysis": feature_bias,
+        # BASL-LR data for Figure 2(b) and (c) bridge panels
+        "basl_lr_data": basl_lr_data,
     }
 
 
@@ -342,6 +433,11 @@ def main():
     with open(exp_dir / "feature_bias_analysis.json", "w") as f:
         json.dump(all_feature_bias, f, indent=2)
 
+    # Save BASL-LR data (for Figure 2 bridge panels b and c)
+    all_basl_lr = [t["basl_lr_data"] for t in trials]
+    with open(exp_dir / "basl_lr_data.json", "w") as f:
+        json.dump(all_basl_lr, f, indent=2)
+
     # Aggregate results (Table 2)
     def mean_std(key):
         values = [t[key] for t in trials]
@@ -386,6 +482,7 @@ def main():
     print(f"  - aggregated.json: Table 2 data")
     print(f"  - metrics_history_seed*.json: Figures 3-4 data")
     print(f"  - feature_bias_analysis.json: Figure 4 feature bias data")
+    print(f"  - basl_lr_data.json: Figure 2(b,c) BASL-LR bridge panel data")
 
 
 if __name__ == "__main__":

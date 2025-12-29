@@ -19,10 +19,11 @@ acceptance_loop:
   initial_batch_size: 100
   target_accept_rate: 0.15  # alpha = 0.15
   x_v_feature: "x_v"   # Bureau score: x_v = -x0 (higher = lower risk)
+  acceptance_mode: "model"  # Model-based for Exp II (creates feedback loop for BASL)
 
 basl:
   filter_proportion: 0.15  # rho = 0.1-0.3, default ~0.15
-  max_iterations: 1        # Single iteration per period (pseudo-labels discarded)
+  max_iterations: 3        # j_max = 3 per paper Appendix E.1 (conservative BASL)
   pseudo_threshold: 0.5
 
 xgboost:
