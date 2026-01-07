@@ -25,21 +25,52 @@ def load_yaml(path: Path | str) -> dict[str, Any]:
 
 
 class GaussianMixtureConfig(BaseModel):
-    """Configuration for Gaussian mixture components."""
+    """Configuration for 2-component GMM per class.
 
-    mu_good_base: List[float] = Field(default=[0.0, 0.0])
-    mu_bad_base: List[float] = Field(default=[2.0, 1.0])
-    component_offset: float = 1.0
-    sigma_max: float = 1.0
+    Per paper Algorithm C.1:
+    - Each class has 2 mixture components for realistic overlap
+    - Informative features (X1, X2): class-conditional means
+    - Noise features (N1, N2): N(0, I) identical for both classes
+
+    Default means create overlap between good/bad classes:
+    - Good (y=0): μ_g1=(0,0), μ_g2=(1,1)
+    - Bad (y=1): μ_b1=(2,1), μ_b2=(3,2)
+    """
+
+    # Covariance scale for informative features
+    # Larger = more overlap between classes
+    sigma_max: float = 1.5
+
+    # Good class (y=0) mixture component means for X1, X2
+    mu_good_1: List[float] = Field(default=[0.0, 0.0])
+    mu_good_2: List[float] = Field(default=[1.0, 1.0])
+
+    # Bad class (y=1) mixture component means for X1, X2
+    mu_bad_1: List[float] = Field(default=[2.0, 1.0])
+    mu_bad_2: List[float] = Field(default=[3.0, 2.0])
+
+    # Mixture weights (equal by default)
+    weight_good: List[float] = Field(default=[0.5, 0.5])
+    weight_bad: List[float] = Field(default=[0.5, 0.5])
 
 
 class SyntheticDataConfig(BaseModel):
-    """Configuration for synthetic data generation."""
+    """Configuration for synthetic data generation.
+
+    Paper-faithful implementation per Algorithm C.1:
+    1. Generate y ~ Bernoulli(bad_rate)
+    2. Generate X|y from class-conditional Gaussians:
+       - X1, X2: informative features (different means for good/bad)
+       - N1, N2: noise features (same distribution for good/bad)
+    3. x_v = the most separating feature (largest |mu_good - mu_bad|)
+
+    The model f_a(X) trains on ALL features [X1, X2, N1, N2].
+    x_v is part of X (typically X1), used for initial acceptance ranking.
+    """
 
     random_seed: int = 42
-    n_features: int = 2
-    n_components: int = 2
-    bad_rate: float = 0.70
+    n_components: int = 2  # Number of GMM components
+    bad_rate: float = 0.70  # Target bad rate
     n_holdout: int = 3000
     gaussian_mixture: GaussianMixtureConfig = Field(
         default_factory=GaussianMixtureConfig
@@ -93,15 +124,17 @@ class AcceptanceLoopConfig(BaseModel):
     - Separate external holdout for oracle evaluation
 
     Acceptance modes:
-    - "feature": Use x_v feature threshold (for Exp I - evaluation experiments)
+    - "feature": Use x_v (most separating feature) threshold (for Exp I)
     - "model": Use f_a(X) model scores after first batch (for Exp II - BASL dynamics)
+
+    Note: x_v is determined by the generator as the feature with largest
+    |mu_good - mu_bad|, typically X1.
     """
 
     n_periods: int = 500
     batch_size: int = 100
     target_accept_rate: float = 0.15  # α
     initial_batch_size: int = 100
-    x_v_feature: str = "x_v"  # Bureau score: x_v = -x0 (higher = lower risk)
     acceptance_mode: str = "feature"  # "feature" for Exp I, "model" for Exp II
     random_seed: int = 42
 

@@ -1,0 +1,19 @@
+{
+  "seed": 42,
+  "n_periods": 500,
+  "n_accepts": 7515,
+  "n_rejects": 42585,
+  "accepts_bad_rate": 0.24218230206254157,
+  "rejects_bad_rate": 0.7811670776094869,
+  "holdout_bad_rate": 0.699,
+  "oracle_auc": 0.8567898242017415,
+  "oracle_abr": 0.3345198739483839,
+  "model_holdout_auc": 0.5396550786310244,
+  "model_holdout_abr": 0.6614121357524002,
+  "accepts_auc": 0.5396550786310244,
+  "accepts_abr": 0.6614121357524002,
+  "accepts_abr_bias": 0.3268922618040163,
+  "bayesian_auc": 0.7379854653693315,
+  "bayesian_abr": 0.12626440166378103,
+  "bayesian_abr_bias": -0.20825547228460287
+}

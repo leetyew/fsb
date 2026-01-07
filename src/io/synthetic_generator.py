@@ -1,12 +1,17 @@
 """
 Synthetic data generator for credit scoring experiments.
 
-Implements Gaussian Mixture Model generation per paper Appendix E.1.
-Key parameters from Table E.9:
-- C=2 components
-- μ_g1=(0,0), μ_b1=(2,1) for goods/bads in component 1
-- Covariance entries from U(0, σ_max), σ_max=1.0
-- Default bad_rate=0.70, n_holdout=3000
+Paper-faithful implementation per Algorithm C.1:
+1. Generate y ~ Bernoulli(bad_rate)
+2. For each sample, select mixture component (2 per class)
+3. Generate informative features X1, X2 from class/component-specific Gaussian
+4. Generate noise features N1, N2 from N(0, I) - identical for all classes
+5. x_v = the most separating feature (largest |E[X|y=0] - E[X|y=1]|)
+
+Key design decisions per paper directives:
+- Noise features are INDEPENDENT of class and informative features
+- Covariance for informative features is non-degenerate and PSD
+- Classes must overlap (Oracle AUC < 1.0)
 """
 
 from __future__ import annotations
@@ -19,149 +24,174 @@ from src.config import SyntheticDataConfig
 
 class SyntheticGenerator:
     """
-    Generates synthetic credit data using Gaussian Mixture Models.
+    Generates synthetic credit data per paper Algorithm C.1.
 
-    Each applicant belongs to one of C mixture components and is either
-    'good' (y=0) or 'bad' (y=1). Label is assigned first via Bernoulli(bad_rate),
-    then features are sampled from class-specific Gaussian distributions.
+    Uses 2-component GMM per class for informative features:
+    - Good (y=0): μ_g1=(0,0), μ_g2=(1,1)
+    - Bad (y=1): μ_b1=(2,1), μ_b2=(3,2)
+
+    Noise features N1, N2 are drawn from N(0, I) identically for all samples.
+    x_v is the feature with largest class-mean separation (typically X1).
     """
+
+    # Feature names matching paper Figure 2(b)
+    INFORMATIVE_FEATURES = ["X1", "X2"]
+    NOISE_FEATURES = ["N1", "N2"]
+    ALL_FEATURES = INFORMATIVE_FEATURES + NOISE_FEATURES
 
     def __init__(self, cfg: SyntheticDataConfig):
         self.cfg = cfg
         self.rng = np.random.default_rng(cfg.random_seed)
 
-        # Pre-generate GMM parameters at init for consistency across samples
-        self._mu_good, self._mu_bad = self._generate_means()
-        self._sigma_good, self._sigma_bad = self._generate_covariances()
+        # Store GMM parameters for informative features
+        gm = cfg.gaussian_mixture
+        self._mu_good = [np.array(gm.mu_good_1), np.array(gm.mu_good_2)]
+        self._mu_bad = [np.array(gm.mu_bad_1), np.array(gm.mu_bad_2)]
+        self._weight_good = np.array(gm.weight_good)
+        self._weight_bad = np.array(gm.weight_bad)
 
-    def _generate_means(self) -> tuple[np.ndarray, np.ndarray]:
+        # Normalize weights
+        self._weight_good = self._weight_good / self._weight_good.sum()
+        self._weight_bad = self._weight_bad / self._weight_bad.sum()
+
+        # Generate covariance for informative features (shared across components)
+        self._sigma_info = self._generate_informative_covariance(gm.sigma_max)
+
+        # Determine x_v: feature with largest mean separation
+        self._x_v_feature = self._find_most_separating_feature()
+
+    @property
+    def x_v_feature(self) -> str:
+        """Return the name of the visible/acceptance feature (most separating)."""
+        return self._x_v_feature
+
+    @property
+    def feature_cols(self) -> list[str]:
+        """Return all feature column names."""
+        return self.ALL_FEATURES.copy()
+
+    def _generate_informative_covariance(self, sigma_max: float) -> np.ndarray:
+        """Generate non-degenerate PSD covariance for informative features.
+
+        Uses random matrix construction: Σ = A @ A.T + diag_jitter
+        This guarantees PSD and creates realistic correlations.
         """
-        Generate component-specific means for goods and bads.
+        n_info = len(self.INFORMATIVE_FEATURES)
 
-        From paper Table E.9:
-        - μ_g1 = (0, 0), μ_b1 = (2, 1)
-        - μ_gc = μ_g1 + (c-1), μ_bc = μ_b1 + (c-1) for c > 1
+        # Generate random matrix with entries in (0, sqrt(sigma_max))
+        # This ensures variance is proportional to sigma_max
+        A = self.rng.uniform(0.3, np.sqrt(sigma_max), size=(n_info, n_info))
 
-        Returns:
-            (mu_good, mu_bad): Arrays of shape (n_components, n_features)
+        # Create PSD matrix
+        cov = A @ A.T
+
+        # Add diagonal jitter for numerical stability and ensure non-degeneracy
+        min_var = 0.5  # Minimum variance to prevent tight clusters
+        cov += min_var * np.eye(n_info)
+
+        return cov
+
+    def _find_most_separating_feature(self) -> str:
+        """Find the feature with largest |E[X|y=0] - E[X|y=1]|.
+
+        Computes expected mean for each class using mixture weights.
+        This is x_v - the 'bureau score' feature used for acceptance ranking.
         """
-        n_comp = self.cfg.n_components
-        n_feat = self.cfg.n_features
-        offset = self.cfg.gaussian_mixture.component_offset
+        # Expected mean for good class (weighted avg of component means)
+        mu_good_expected = (
+            self._weight_good[0] * self._mu_good[0] +
+            self._weight_good[1] * self._mu_good[1]
+        )
 
-        mu_g_base = np.array(self.cfg.gaussian_mixture.mu_good_base)
-        mu_b_base = np.array(self.cfg.gaussian_mixture.mu_bad_base)
+        # Expected mean for bad class
+        mu_bad_expected = (
+            self._weight_bad[0] * self._mu_bad[0] +
+            self._weight_bad[1] * self._mu_bad[1]
+        )
 
-        # Pad or truncate to match n_features
-        mu_g_base = self._adjust_array_length(mu_g_base, n_feat)
-        mu_b_base = self._adjust_array_length(mu_b_base, n_feat)
-
-        mu_good = np.zeros((n_comp, n_feat))
-        mu_bad = np.zeros((n_comp, n_feat))
-
-        for c in range(n_comp):
-            mu_good[c] = mu_g_base + c * offset
-            mu_bad[c] = mu_b_base + c * offset
-
-        return mu_good, mu_bad
-
-    def _adjust_array_length(self, arr: np.ndarray, target_len: int) -> np.ndarray:
-        """Pad with zeros or truncate array to target length."""
-        if len(arr) < target_len:
-            return np.pad(arr, (0, target_len - len(arr)))
-        return arr[:target_len]
-
-    def _generate_covariances(self) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Generate component-specific covariance matrices.
-
-        Per paper: entries sampled from U(0, σ_max), then made
-        symmetric positive-definite via Σ = A @ A.T + εI
-
-        Returns:
-            (sigma_good, sigma_bad): Arrays of shape (n_components, n_features, n_features)
-        """
-        n_comp = self.cfg.n_components
-        n_feat = self.cfg.n_features
-        sigma_max = self.cfg.gaussian_mixture.sigma_max
-        eps = 1e-6
-
-        sigma_good = np.zeros((n_comp, n_feat, n_feat))
-        sigma_bad = np.zeros((n_comp, n_feat, n_feat))
-
-        for c in range(n_comp):
-            A_good = self.rng.uniform(0, sigma_max, size=(n_feat, n_feat))
-            A_bad = self.rng.uniform(0, sigma_max, size=(n_feat, n_feat))
-
-            sigma_good[c] = A_good @ A_good.T + eps * np.eye(n_feat)
-            sigma_bad[c] = A_bad @ A_bad.T + eps * np.eye(n_feat)
-
-        return sigma_good, sigma_bad
+        # Find most separating informative feature
+        separation = np.abs(mu_good_expected - mu_bad_expected)
+        most_sep_idx = np.argmax(separation)
+        return self.INFORMATIVE_FEATURES[most_sep_idx]
 
     def _sample_applicants(self, n_samples: int) -> pd.DataFrame:
+        """Generate applicants per Algorithm C.1.
+
+        Order:
+        1. Sample labels y ~ Bernoulli(bad_rate)
+        2. For each sample, select mixture component
+        3. Sample informative features from component-specific Gaussian
+        4. Sample noise features from N(0, I) - class-independent
         """
-        Sample applicants from the GMM population.
+        n_info = len(self.INFORMATIVE_FEATURES)
+        n_noise = len(self.NOISE_FEATURES)
 
-        Steps per paper:
-        1. Sample component assignment uniformly
-        2. Sample label y from Bernoulli(bad_rate)
-        3. Sample features from N(μ, Σ) for assigned component and class
-
-        Args:
-            n_samples: Number of applicants to generate.
-
-        Returns:
-            DataFrame with feature columns (x0, x1, ...) and 'y' label.
-        """
-        n_feat = self.cfg.n_features
-        n_comp = self.cfg.n_components
-
-        components = self.rng.integers(0, n_comp, size=n_samples)
+        # Step 1: Sample labels
         labels = self.rng.binomial(1, self.cfg.bad_rate, size=n_samples)
 
-        features = np.zeros((n_samples, n_feat))
+        # Step 2 & 3: Sample informative features from GMM
+        informative = np.zeros((n_samples, n_info))
 
-        for c in range(n_comp):
-            # Good applicants (y=0) in component c
-            mask_good = (components == c) & (labels == 0)
-            n_good = mask_good.sum()
-            if n_good > 0:
-                features[mask_good] = self.rng.multivariate_normal(
-                    self._mu_good[c], self._sigma_good[c], size=n_good
-                )
+        # Good applicants (y=0)
+        mask_good = labels == 0
+        n_good = mask_good.sum()
+        if n_good > 0:
+            # Select component for each good sample
+            components_good = self.rng.choice(
+                2, size=n_good, p=self._weight_good
+            )
+            for comp in [0, 1]:
+                comp_mask = components_good == comp
+                n_comp = comp_mask.sum()
+                if n_comp > 0:
+                    informative[np.where(mask_good)[0][comp_mask]] = (
+                        self.rng.multivariate_normal(
+                            self._mu_good[comp], self._sigma_info, size=n_comp
+                        )
+                    )
 
-            # Bad applicants (y=1) in component c
-            mask_bad = (components == c) & (labels == 1)
-            n_bad = mask_bad.sum()
-            if n_bad > 0:
-                features[mask_bad] = self.rng.multivariate_normal(
-                    self._mu_bad[c], self._sigma_bad[c], size=n_bad
-                )
+        # Bad applicants (y=1)
+        mask_bad = labels == 1
+        n_bad = mask_bad.sum()
+        if n_bad > 0:
+            # Select component for each bad sample
+            components_bad = self.rng.choice(
+                2, size=n_bad, p=self._weight_bad
+            )
+            for comp in [0, 1]:
+                comp_mask = components_bad == comp
+                n_comp = comp_mask.sum()
+                if n_comp > 0:
+                    informative[np.where(mask_bad)[0][comp_mask]] = (
+                        self.rng.multivariate_normal(
+                            self._mu_bad[comp], self._sigma_info, size=n_comp
+                        )
+                    )
 
-        feature_cols = [f"x{i}" for i in range(n_feat)]
-        df = pd.DataFrame(features, columns=feature_cols)
+        # Step 4: Sample noise features from N(0, I) - INDEPENDENT of class
+        # This is critical: noise must be identical distribution for y=0 and y=1
+        noise = self.rng.standard_normal((n_samples, n_noise))
+
+        # Combine into DataFrame
+        features = np.hstack([informative, noise])
+        df = pd.DataFrame(features, columns=self.ALL_FEATURES)
         df["y"] = labels
 
         return df
 
     def generate_population(self, n_samples: int) -> pd.DataFrame:
-        """
-        Generate a population of applicants.
+        """Generate a population of applicants.
 
         Args:
             n_samples: Number of applicants to generate.
 
         Returns:
-            DataFrame with features (x0, x1, ...) and label (y).
+            DataFrame with features [X1, X2, N1, N2] and label y.
         """
         return self._sample_applicants(n_samples)
 
     def generate_holdout(self) -> pd.DataFrame:
-        """
-        Generate a representative holdout set.
-
-        The holdout represents the true population distribution with
-        observed labels for all applicants (no selection bias).
+        """Generate a representative holdout set.
 
         Returns:
             DataFrame with n_holdout samples.

@@ -70,9 +70,9 @@ def collect_figure2_data(
 ) -> dict[str, Any]:
     """Collect data for Figure 2 panels (a), (b), (c) - Experiment I diagnostic data.
 
-    Panel (a): Feature distributions (population, accepts, rejects)
-    Panel (b): LR coefficients (accepts-only vs oracle) - 2 features only
-    Panel (c): LR score distributions (accepts-only vs oracle) - 2 features only
+    Panel (a): x_v (most separating feature, e.g. X1) distributions
+    Panel (b): LR coefficients on ALL 4 features (X1, X2, N1, N2) + Intercept
+    Panel (c): LR score distributions (accepts-only vs oracle)
 
     Note: BASL models are NOT included in Experiment I. They come from Experiment II.
 
@@ -83,24 +83,26 @@ def collect_figure2_data(
         model: Accepts-only model (XGBoost) - not used for panels b,c
         oracle_model: Oracle model (XGBoost) - not used for panels b,c
         generator: Data generator for population sample
-        feature_cols: List of feature column names
+        feature_cols: List of feature column names [X1, X2, N1, N2]
 
     Returns:
         Dictionary with Figure 2 panel data
     """
-    # Panel (a): Feature distributions
-    # Sample from population for comparison
+    # Panel (a): x_v (most separating feature) distributions - shows acceptance bias
+    # Per paper: x_v is the existing feature with largest |mu_good - mu_bad|
+    x_v_feature = generator.x_v_feature  # Typically "X1"
     population_sample = generator.generate_population(n_samples=3000)
 
     panel_a_data = {
-        "population_x0": population_sample["x0"].tolist(),
-        "accepts_x0": D_a["x0"].tolist(),
-        "rejects_x0": D_r["x0"].tolist(),
+        "x_v_feature": x_v_feature,  # Record which feature is x_v
+        "population_x_v": population_sample[x_v_feature].tolist(),
+        "accepts_x_v": D_a[x_v_feature].tolist(),
+        "rejects_x_v": D_r[x_v_feature].tolist(),
     }
 
-    # Panel (b): Model coefficients using 2-feature Logistic Regression
-    # Paper uses ONLY x0 and x1 for interpretability
-    lr_feature_cols = ["x0", "x1"]
+    # Panel (b): Model coefficients using ALL 4 features (paper Figure 2b)
+    # Paper x-axis: Intercept, X1, X2, N1, N2
+    lr_feature_cols = feature_cols  # [X1, X2, N1, N2]
     X_a = D_a[lr_feature_cols].values
     y_a = D_a["y"].values
     X_r = D_r[lr_feature_cols].values
@@ -108,21 +110,20 @@ def collect_figure2_data(
 
     lr_cfg = LogisticRegressionConfig(C=1.0, penalty="l2", solver="lbfgs")
 
-    # Accepts-only LR model (2 features)
+    # Accepts-only LR model (surrogate for XGB)
     lr_accepts = LogisticRegressionModel(lr_cfg)
     lr_accepts.fit(X_a, y_a)
 
-    # Oracle LR model (2 features, trained on full data)
+    # Oracle LR model (trained on full data)
     lr_oracle = LogisticRegressionModel(lr_cfg)
     X_all = np.vstack([X_a, X_r])
     y_all = np.concatenate([y_a, y_r])
     lr_oracle.fit(X_all, y_all)
 
-    # Extract coefficients: [x0_coef, x1_coef] + intercept
-    # Paper labels: N1 (x0), N2 (x1), Intercept
+    # Paper Figure 2(b) x-axis order: Intercept, X1, X2, N1, N2
     panel_b_data = {
-        "feature_names": ["N1", "N2", "Intercept"],  # Paper labels
-        "lr_features": lr_feature_cols,  # Actual features used
+        "feature_names": ["Intercept"] + lr_feature_cols,  # Paper order
+        "lr_features": lr_feature_cols,
         "accepts_coefficients": lr_accepts._model.coef_[0].tolist(),
         "accepts_intercept": float(lr_accepts._model.intercept_[0]),
         "oracle_coefficients": lr_oracle._model.coef_[0].tolist(),
@@ -157,9 +158,11 @@ def run_trial(seed: int) -> dict[str, Any]:
     - Bayesian evaluation uses LR-calibrated prior
     """
     # Configure data generator
+    # Paper-faithful: class-conditional Gaussians with 4 features:
+    # - X1, X2: informative (class-conditional means differ)
+    # - N1, N2: noise (same distribution for good/bad)
     data_cfg = SyntheticDataConfig(
         random_seed=seed,
-        n_features=CONFIG["synthetic_data"]["n_features"],
         n_components=CONFIG["synthetic_data"]["n_components"],
         bad_rate=CONFIG["synthetic_data"]["bad_rate"],
         n_holdout=CONFIG["synthetic_data"]["n_holdout"],
@@ -167,12 +170,12 @@ def run_trial(seed: int) -> dict[str, Any]:
     generator = SyntheticGenerator(data_cfg)
 
     # Configure AcceptanceLoop
+    # x_v is determined by generator (most separating feature)
     loop_cfg = AcceptanceLoopConfig(
         n_periods=CONFIG["acceptance_loop"]["n_periods"],
         batch_size=CONFIG["acceptance_loop"]["batch_size"],
         initial_batch_size=CONFIG["acceptance_loop"]["initial_batch_size"],
         target_accept_rate=CONFIG["acceptance_loop"]["target_accept_rate"],
-        x_v_feature=CONFIG["acceptance_loop"]["x_v_feature"],
         random_seed=seed,
     )
 
@@ -218,7 +221,8 @@ def run_trial(seed: int) -> dict[str, Any]:
     )
 
     # Collect Figure 2 panel data (a, b, c)
-    feature_cols = [f"x{i}" for i in range(data_cfg.n_features)]
+    # Paper-faithful: feature_cols = [X1, X2, N1, N2]
+    feature_cols = generator.feature_cols
     figure2_data = collect_figure2_data(
         D_a=D_a,
         D_r=D_r,

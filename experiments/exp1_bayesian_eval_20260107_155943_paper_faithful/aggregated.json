@@ -1,0 +1,16 @@
+{
+  "n_trials": 1,
+  "n_periods": 500,
+  "oracle_abr_mean": 0.3345198739483839,
+  "oracle_abr_std": 0.0,
+  "model_holdout_abr_mean": 0.6614121357524002,
+  "model_holdout_abr_std": 0.0,
+  "accepts_abr_mean": 0.6614121357524002,
+  "accepts_abr_std": 0.0,
+  "accepts_abr_bias_mean": 0.3268922618040163,
+  "accepts_abr_bias_std": 0.0,
+  "bayesian_abr_mean": 0.12626440166378103,
+  "bayesian_abr_std": 0.0,
+  "bayesian_abr_bias_mean": -0.20825547228460287,
+  "bayesian_abr_bias_std": 0.0
+}

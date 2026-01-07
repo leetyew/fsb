@@ -8,8 +8,9 @@
 # CRITICAL: BASL pseudo-labels are ephemeral and discarded each iteration
 
 synthetic_data:
-  n_features: 2        # 1 informative (x0) + 1 noise
-  n_components: 2      # Good/bad borrower distributions
+  # Paper-faithful: 4 features (X1, X2 informative; N1, N2 noise)
+  # x_v = most separating feature (typically X1), part of X not separate
+  n_components: 2      # GMM components for feature distribution
   bad_rate: 0.70       # 70% bad rate per paper Section 3.1
   n_holdout: 3000      # Per paper Algorithm C.2
 
@@ -18,7 +19,7 @@ acceptance_loop:
   batch_size: 100      # n = 100 applicants per period
   initial_batch_size: 100
   target_accept_rate: 0.15  # alpha = 0.15
-  x_v_feature: "x_v"   # Bureau score: x_v = -x0 (higher = lower risk)
+  # x_v is determined by generator (most separating feature, typically X1)
   acceptance_mode: "model"  # Model-based for Exp II (creates feedback loop for BASL)
 
 basl:

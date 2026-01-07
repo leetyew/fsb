@@ -57,34 +57,33 @@ class AcceptanceLoop:
         # BASL trainer only if config provided
         self.basl_trainer = BASLTrainer(basl_cfg) if basl_cfg is not None else None
 
-    def _add_bureau_score(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add bureau-like score column x_v based on the raw synthetic x0.
+    def _get_x_v_feature(self) -> str:
+        """Get the visible/acceptance feature name.
 
-        Per paper Appendix E.1, bad borrowers have higher x0 than good borrowers.
-        We define x_v = -x0 so that:
-          - good borrowers (lower x0) get higher x_v (better score)
-          - bad borrowers (higher x0) get lower x_v (worse score)
-
-        This keeps the generator faithful to Appendix E.1 while making
-        'highest x_v' correspond to lowest risk, matching Algorithm C.2.
+        Per paper: x_v is the most separating feature (largest |mu_good - mu_bad|).
+        The generator determines this automatically.
         """
-        df = df.copy()
-        df["x_v"] = -df["x0"]
-        return df
+        return self.generator.x_v_feature
 
     def _accept_by_feature(
         self, df: pd.DataFrame, feature: str, accept_rate: float
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Accept top α percentile by score (higher x_v = lower risk).
+        """Accept lowest α percentile by feature (lower x_v = lower risk).
 
-        Per Algorithm C.2:
-          - τ is the (1-α)-th percentile of x_v (e.g. 85th percentile for α=0.15)
-          - D_a = { (X_i, y_i): x_{i,v} >= τ }  (top α fraction by score)
-          - D_r = { (X_i, y_i): x_{i,v} <  τ }
+        Per paper hyperparameters: "Accept the lowest α-quantile of x_v"
+        In the paper's setup:
+          - Good applicants (y=0) have LOWER feature values (mu_good=0)
+          - Bad applicants (y=1) have HIGHER feature values (mu_bad=2)
+          - So we accept those with LOWEST x_v values
+
+        Algorithm:
+          - τ is the α-th percentile of x_v (e.g. 15th percentile for α=0.15)
+          - D_a = { (X_i, y_i): x_{i,v} <= τ }  (lowest α fraction by feature)
+          - D_r = { (X_i, y_i): x_{i,v} >  τ }
         """
-        # For α=0.15, compute 85th percentile threshold
-        threshold = np.percentile(df[feature], (1 - accept_rate) * 100)
-        accept_mask = df[feature] >= threshold
+        # For α=0.15, compute 15th percentile threshold
+        threshold = np.percentile(df[feature], accept_rate * 100)
+        accept_mask = df[feature] <= threshold
         return df[accept_mask].copy(), df[~accept_mask].copy()
 
     def _accept_by_model(
@@ -132,19 +131,20 @@ class AcceptanceLoop:
             (D_a, D_r, holdout, model, oracle_model, metrics_history)
             where metrics_history contains oracle/accepts/bayesian metrics per iteration
         """
-        feature_cols = [f"x{i}" for i in range(self.generator.cfg.n_features)]
+        # Use feature columns from generator (paper-faithful: X1, X2, N1, N2)
+        feature_cols = self.generator.feature_cols
         alpha = self.cfg.target_accept_rate
+        x_v_feature = self._get_x_v_feature()
 
         # External holdout for oracle evaluation (drawn separately per Algorithm C.2)
         X_holdout = holdout[feature_cols].values
         y_holdout = holdout["y"].values
 
         # Step 1: Generate initial batch and accept by feature (no model yet)
+        # Per Algorithm C.2: first batch uses x_v (most separating feature) for ranking
         initial_batch = self.generator.generate_population(self.cfg.initial_batch_size)
-        # Add bureau score x_v = -x0 for paper-faithful acceptance
-        initial_batch = self._add_bureau_score(initial_batch)
         initial_accepts, initial_rejects = self._accept_by_feature(
-            initial_batch, self.cfg.x_v_feature, alpha
+            initial_batch, x_v_feature, alpha
         )
 
         # Initialize cumulative accepts and rejects (true labels only)
@@ -225,8 +225,6 @@ class AcceptanceLoop:
         for iteration in iterator:
             # Generate new batch of applicants this period
             batch = self.generator.generate_population(self.cfg.batch_size)
-            # Add bureau score x_v = -x0 for paper-faithful acceptance
-            batch = self._add_bureau_score(batch)
 
             # Acceptance decision based on configured mode
             if self.cfg.acceptance_mode == "model":
@@ -237,9 +235,9 @@ class AcceptanceLoop:
                 )
             else:
                 # Feature-based acceptance (Exp I / MAR setting)
-                # Accept by x_v feature only - cleanly isolates sampling bias
+                # Accept by x_v (most separating feature) - cleanly isolates sampling bias
                 batch_accepts, batch_rejects = self._accept_by_feature(
-                    batch, self.cfg.x_v_feature, alpha
+                    batch, x_v_feature, alpha
                 )
 
             # Accumulate for final return

@@ -89,7 +89,8 @@ def train_basl_lr_for_diagnostics(
     Returns:
         Dictionary with BASL-LR coefficients and scores
     """
-    lr_feature_cols = ["x0", "x1"]
+    # Use all 4 features per paper (X1, X2, N1, N2)
+    lr_feature_cols = SyntheticGenerator.ALL_FEATURES
     X_a = D_a[lr_feature_cols].values
     y_a = D_a["y"].values
     X_r = D_r[lr_feature_cols].values
@@ -134,9 +135,10 @@ def train_basl_lr_for_diagnostics(
     X_holdout = holdout[lr_feature_cols].values
     basl_scores = basl_lr.predict_proba(X_holdout)
 
+    # Paper Figure 2(b) x-axis order: Intercept, X1, X2, N1, N2
     return {
-        "feature_names": ["N1", "N2", "Intercept"],
-        "lr_features": lr_feature_cols,
+        "feature_names": ["Intercept"] + list(lr_feature_cols),
+        "lr_features": list(lr_feature_cols),
         "basl_coefficients": basl_lr._model.coef_[0].tolist(),
         "basl_intercept": float(basl_lr._model.intercept_[0]),
         "basl_scores": basl_scores.tolist(),
@@ -151,24 +153,27 @@ def compute_feature_bias_analysis(
     feature_cols: list[str],
     n_bins: int = 10,
 ) -> dict[str, list[dict]]:
-    """Compute predicted vs true bad rate across x0 bins for Figure 4.
+    """Compute predicted vs true bad rate across X1 bins for Figure 4.
+
+    Uses X1 (the most informative/separating feature) for binning.
 
     Args:
         model: BASL model (f_c)
         oracle_model: Oracle model (f_o)
         holdout: Holdout data with true labels
-        feature_cols: List of feature column names
-        n_bins: Number of bins for x0
+        feature_cols: List of feature column names [X1, X2, N1, N2]
+        n_bins: Number of bins for X1
 
     Returns:
         Dict of model_name -> list of bin results
     """
-    x0 = holdout["x0"].values
+    # Use X1 (most informative feature) for binning
+    x1_values = holdout["X1"].values
     y_true = holdout["y"].values
     X_h = holdout[feature_cols].values
 
-    # Create bins based on x0 percentiles
-    bin_edges = np.percentile(x0, np.linspace(0, 100, n_bins + 1))
+    # Create bins based on X1 percentiles
+    bin_edges = np.percentile(x1_values, np.linspace(0, 100, n_bins + 1))
 
     results = {}
     for model_name, m in [("model", model), ("oracle", oracle_model)]:
@@ -177,15 +182,15 @@ def compute_feature_bias_analysis(
 
         for i in range(n_bins):
             if i == n_bins - 1:
-                mask = (x0 >= bin_edges[i]) & (x0 <= bin_edges[i + 1])
+                mask = (x1_values >= bin_edges[i]) & (x1_values <= bin_edges[i + 1])
             else:
-                mask = (x0 >= bin_edges[i]) & (x0 < bin_edges[i + 1])
+                mask = (x1_values >= bin_edges[i]) & (x1_values < bin_edges[i + 1])
 
             if mask.sum() > 0:
                 model_results.append({
                     "bin": i,
-                    "x0_min": float(bin_edges[i]),
-                    "x0_max": float(bin_edges[i + 1]),
+                    "X1_min": float(bin_edges[i]),
+                    "X1_max": float(bin_edges[i + 1]),
                     "n_samples": int(mask.sum()),
                     "true_bad_rate": float(y_true[mask].mean()),
                     "predicted_bad_rate": float(scores[mask].mean()),
@@ -208,9 +213,11 @@ def run_trial(seed: int) -> dict[str, Any]:
     - Pseudo-labels discarded each iteration
     """
     # Configure data generator
+    # Paper-faithful: class-conditional Gaussians with 4 features:
+    # - X1, X2: informative (class-conditional means differ)
+    # - N1, N2: noise (same distribution for good/bad)
     data_cfg = SyntheticDataConfig(
         random_seed=seed,
-        n_features=CONFIG["synthetic_data"]["n_features"],
         n_components=CONFIG["synthetic_data"]["n_components"],
         bad_rate=CONFIG["synthetic_data"]["bad_rate"],
         n_holdout=CONFIG["synthetic_data"]["n_holdout"],
@@ -218,12 +225,12 @@ def run_trial(seed: int) -> dict[str, Any]:
     generator = SyntheticGenerator(data_cfg)
 
     # Configure AcceptanceLoop
+    # x_v is determined by generator (most separating feature)
     loop_cfg = AcceptanceLoopConfig(
         n_periods=CONFIG["acceptance_loop"]["n_periods"],
         batch_size=CONFIG["acceptance_loop"]["batch_size"],
         initial_batch_size=CONFIG["acceptance_loop"]["initial_batch_size"],
         target_accept_rate=CONFIG["acceptance_loop"]["target_accept_rate"],
-        x_v_feature=CONFIG["acceptance_loop"]["x_v_feature"],
         random_seed=seed,
     )
 
@@ -280,7 +287,8 @@ def run_trial(seed: int) -> dict[str, Any]:
 
     # Extract final metrics
     final_metrics = metrics_history[-1]
-    feature_cols = [f"x{i}" for i in range(data_cfg.n_features)]
+    # Paper-faithful: feature_cols = [X1, X2, N1, N2]
+    feature_cols = generator.feature_cols
 
     # Also run accepts-only baseline for comparison
     # Train accepts-only XGBoost on same final D_a
