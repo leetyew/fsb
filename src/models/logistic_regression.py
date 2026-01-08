@@ -24,16 +24,20 @@ class LogisticRegressionConfig:
 
 
 class LogisticRegressionModel:
-    """L1-regularized Logistic Regression for BASL weak learner."""
+    """L1-regularized Logistic Regression for BASL weak learner.
+
+    Note: This wrapper returns P(y=1) as a 1D array.
+    """
 
     def __init__(self, cfg: LogisticRegressionConfig | None = None):
-        """Initialize model with config.
-
-        Args:
-            cfg: Configuration. Uses defaults if None.
-        """
         self.cfg = cfg or LogisticRegressionConfig()
-        self._model = LogisticRegression(
+        self._model: LogisticRegression | None = None
+        self._single_class: int | None = None  # 0 or 1 if degenerate
+        self._eps = getattr(self.cfg, "eps", 1e-6)
+
+    def _create_model(self) -> LogisticRegression:
+        """Create a fresh LogisticRegression instance."""
+        return LogisticRegression(
             penalty=self.cfg.penalty,
             C=self.cfg.C,
             solver=self.cfg.solver,
@@ -42,21 +46,22 @@ class LogisticRegressionModel:
         )
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Fit model on training data.
-
-        Args:
-            X: Feature matrix (n_samples, n_features).
-            y: Binary labels (0=good, 1=bad).
-        """
+        unique_classes = np.unique(y)
+        if len(unique_classes) == 1:
+            self._single_class = int(unique_classes[0])
+            self._model = None  # Clear any previous model to prevent accidental use
+            return
+        self._single_class = None
+        self._model = self._create_model()
         self._model.fit(X, y)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Predict probability of bad (y=1).
-
-        Args:
-            X: Feature matrix (n_samples, n_features).
-
-        Returns:
-            Probability of class 1 (bad) for each sample.
-        """
+        """Return P(y=1) for each sample."""
+        if self._single_class is not None:
+            if self._single_class == 0:
+                return np.full(len(X), self._eps, dtype=float)
+            else:
+                return np.full(len(X), 1.0 - self._eps, dtype=float)
+        if self._model is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
         return self._model.predict_proba(X)[:, 1]

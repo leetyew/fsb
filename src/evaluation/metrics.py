@@ -24,8 +24,10 @@ def compute_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
         y_score: Predicted probability of bad (y=1).
 
     Returns:
-        AUC score in [0, 1].
+        AUC score in [0, 1], or NaN if only one class is present.
     """
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
     return float(roc_auc_score(y_true, y_score))
 
 
@@ -47,8 +49,10 @@ def compute_pauc(
         max_fnr: Maximum FNR to include (default 0.2 = top 80% recall).
 
     Returns:
-        Normalized partial AUC in [0, 1].
+        Normalized partial AUC in [0, 1], or NaN if only one class is present.
     """
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
     # Get ROC curve: fpr, tpr at various thresholds
     fpr, tpr, _ = roc_curve(y_true, y_score)
 

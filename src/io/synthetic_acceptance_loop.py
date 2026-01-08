@@ -429,13 +429,21 @@ class AcceptanceLoop:
             y_holdout, model_scores_holdout, metrics_list, abr_range=abr_range
         )
 
-        # Accepts-only evaluation: evaluate accepts model on HOLDOUT (not D_a)
-        # Per paper definition: "ABR is average bad rate among accepts at 20-40% acceptance"
-        # This shows how the biased model ranks unbiased data (same population as oracle)
-        # Note: This is identical to model_holdout_metrics but named for paper terminology
-        accepts_metrics = model_holdout_metrics
+        # Accepts-only evaluation: evaluate model on VALIDATION subset of D_a
+        # Per paper Experiment I: this is the BIASED estimate of performance
+        # We hold out 20% of accepts as validation to avoid evaluating on training data
+        n_accepts = len(X_accepts)
+        n_val = max(1, int(n_accepts * 0.2))
+        val_indices = self.rng.choice(n_accepts, size=n_val, replace=False)
+        X_accepts_val = X_accepts[val_indices]
+        y_accepts_val = y_accepts[val_indices]
 
-        # Compute model scores on accepts (needed for Bayesian evaluation)
+        scores_accepts_val = model.predict_proba(X_accepts_val)
+        accepts_metrics = compute_metrics(
+            y_accepts_val, scores_accepts_val, metrics_list, abr_range=abr_range
+        )
+
+        # Compute model scores on ALL accepts (needed for Bayesian evaluation)
         scores_accepts = model.predict_proba(X_accepts)
 
         # Bayesian: MC pseudo-labeling on internal holdout (Algorithm 1)
