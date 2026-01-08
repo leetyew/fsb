@@ -71,24 +71,27 @@ class SyntheticGenerator:
         return self.ALL_FEATURES.copy()
 
     def _generate_informative_covariance(self, sigma_max: float) -> np.ndarray:
-        """Generate non-degenerate PSD covariance for informative features.
+        """Generate PSD covariance for informative features per paper.
 
-        Uses random matrix construction: Σ = A @ A.T + diag_jitter
-        This guarantees PSD and creates realistic correlations.
+        Per Appendix E.1: Covariance entries drawn from U(0, σ_max).
+
+        For 2x2 matrix, Σ = [[a, b], [b, c]] is PSD iff a >= 0, c >= 0, b² <= ac.
+        We use direct PSD sampling (Option A) which guarantees PSD by construction
+        without artificial eigenvalue floors.
         """
         n_info = len(self.INFORMATIVE_FEATURES)
+        assert n_info == 2, "Direct PSD sampling assumes 2 informative features"
 
-        # Generate random matrix with entries in (0, sqrt(sigma_max))
-        # This ensures variance is proportional to sigma_max
-        A = self.rng.uniform(0.3, np.sqrt(sigma_max), size=(n_info, n_info))
+        # Sample diagonal entries from U(0, σ_max)
+        a = self.rng.uniform(0, sigma_max)
+        c = self.rng.uniform(0, sigma_max)
 
-        # Create PSD matrix
-        cov = A @ A.T
+        # Sample off-diagonal from U(0, min(sqrt(ac), σ_max)) to guarantee PSD
+        # b² <= ac ensures positive semi-definiteness
+        max_b = min(np.sqrt(a * c), sigma_max)
+        b = self.rng.uniform(0, max_b) if max_b > 0 else 0.0
 
-        # Add diagonal jitter for numerical stability and ensure non-degeneracy
-        min_var = 0.5  # Minimum variance to prevent tight clusters
-        cov += min_var * np.eye(n_info)
-
+        cov = np.array([[a, b], [b, c]])
         return cov
 
     def _find_most_separating_feature(self) -> str:

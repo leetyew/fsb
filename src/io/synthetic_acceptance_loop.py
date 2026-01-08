@@ -226,19 +226,13 @@ class AcceptanceLoop:
             # Generate new batch of applicants this period
             batch = self.generator.generate_population(self.cfg.batch_size)
 
-            # Acceptance decision based on configured mode
-            if self.cfg.acceptance_mode == "model":
-                # Model-based acceptance (Exp II / Algorithm C.2 feedback loop)
-                # Accept based on f_a(X) scores - creates compounding bias
-                batch_accepts, batch_rejects = self._accept_by_model(
-                    batch, model, alpha, feature_cols
-                )
-            else:
-                # Feature-based acceptance (Exp I / MAR setting)
-                # Accept by x_v (most separating feature) - cleanly isolates sampling bias
-                batch_accepts, batch_rejects = self._accept_by_feature(
-                    batch, x_v_feature, alpha
-                )
+            # Acceptance decision per Algorithm C.2:
+            # - j=0 (initial): accept by x_v (feature) - already done above
+            # - j>=1 (loop): accept by f_a(X) (model score)
+            # This applies to BOTH experiments - the difference is in training (BASL vs baseline)
+            batch_accepts, batch_rejects = self._accept_by_model(
+                batch, model, alpha, feature_cols
+            )
 
             # Accumulate for final return
             all_accepts.append(batch_accepts)

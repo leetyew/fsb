@@ -38,8 +38,8 @@ class GaussianMixtureConfig(BaseModel):
     """
 
     # Covariance scale for informative features
-    # Larger = more overlap between classes
-    sigma_max: float = 1.5
+    # Per Appendix E.1: σ_max = 1 for MAR baseline
+    sigma_max: float = 1.0
 
     # Good class (y=0) mixture component means for X1, X2
     mu_good_1: List[float] = Field(default=[0.0, 0.0])
