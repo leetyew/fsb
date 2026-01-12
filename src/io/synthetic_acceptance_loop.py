@@ -429,19 +429,36 @@ class AcceptanceLoop:
             y_holdout, model_scores_holdout, metrics_list, abr_range=abr_range
         )
 
-        # Accepts-only evaluation: evaluate model on VALIDATION subset of D_a
-        # Per paper Experiment I: this is the BIASED estimate of performance
-        # We hold out 20% of accepts as validation to avoid evaluating on training data
-        n_accepts = len(X_accepts)
-        n_val = max(1, int(n_accepts * 0.2))
-        val_indices = self.rng.choice(n_accepts, size=n_val, replace=False)
-        X_accepts_val = X_accepts[val_indices]
-        y_accepts_val = y_accepts[val_indices]
+        # Accepts-only evaluation: evaluate on H_a (accepted portion of holdout)
+        # Per paper Section 2.1:
+        # - H_a is defined by the BANK'S policy (baseline_model), not the candidate model
+        # - This prevents self-fulfilling acceptance where each model picks its easiest subset
+        # - ABR on H_a is just the empirical bad rate (no re-ranking to avoid α² truncation)
+        #
+        # Use baseline_model (f_a) to define which holdout samples would be accepted
+        baseline_scores_holdout = baseline_model.predict_proba(X_holdout)
+        n_holdout = len(X_holdout)
+        n_accept_holdout = max(1, int(n_holdout * self.cfg.target_accept_rate))
 
-        scores_accepts_val = model.predict_proba(X_accepts_val)
+        # H_a = samples in holdout that the bank would accept (lowest scores)
+        sorted_indices = np.argsort(baseline_scores_holdout)
+        accept_indices = sorted_indices[:n_accept_holdout]
+
+        y_holdout_accepts = y_holdout[accept_indices]
+
+        # Accepts-only ABR = simple empirical bad rate of H_a (no re-ranking)
+        # This is the biased estimator: we only observe accepted population
+        accepts_abr = float(np.mean(y_holdout_accepts))
+
+        # For other metrics (AUC, PAUC, Brier), evaluate candidate model on H_a
+        X_holdout_accepts = X_holdout[accept_indices]
+        scores_holdout_accepts = model.predict_proba(X_holdout_accepts)
         accepts_metrics = compute_metrics(
-            y_accepts_val, scores_accepts_val, metrics_list, abr_range=abr_range
+            y_holdout_accepts, scores_holdout_accepts,
+            ["auc", "pauc", "brier"], abr_range=abr_range
         )
+        # Override ABR with empirical bad rate (not ranking-based)
+        accepts_metrics["abr"] = accepts_abr
 
         # Compute model scores on ALL accepts (needed for Bayesian evaluation)
         scores_accepts = model.predict_proba(X_accepts)
