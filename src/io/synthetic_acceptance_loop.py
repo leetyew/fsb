@@ -430,12 +430,13 @@ class AcceptanceLoop:
         )
 
         # Accepts-only evaluation: evaluate on H_a (accepted portion of holdout)
-        # Per paper Section 2.1:
+        # Per paper Figure 2(d):
         # - H_a is defined by the BANK'S policy (baseline_model), not the candidate model
-        # - This prevents self-fulfilling acceptance where each model picks its easiest subset
-        # - ABR on H_a is just the empirical bad rate (no re-ranking to avoid α² truncation)
+        # - ABR uses the SAME 20-40% integration as Oracle/Bayesian, but on biased sample H_a
+        # - This makes accepts-only ABR model-dependent (ranking by candidate model)
+        # - The "double truncation" (bank α × ABR range) is the bias the paper illustrates
         #
-        # Use baseline_model (f_a) to define which holdout samples would be accepted
+        # Step A: Define H_a using bank policy (fixed across iterations)
         baseline_scores_holdout = baseline_model.predict_proba(X_holdout)
         n_holdout = len(X_holdout)
         n_accept_holdout = max(1, int(n_holdout * self.cfg.target_accept_rate))
@@ -444,21 +445,16 @@ class AcceptanceLoop:
         sorted_indices = np.argsort(baseline_scores_holdout)
         accept_indices = sorted_indices[:n_accept_holdout]
 
+        X_holdout_accepts = X_holdout[accept_indices]
         y_holdout_accepts = y_holdout[accept_indices]
 
-        # Accepts-only ABR = simple empirical bad rate of H_a (no re-ranking)
-        # This is the biased estimator: we only observe accepted population
-        accepts_abr = float(np.mean(y_holdout_accepts))
-
-        # For other metrics (AUC, PAUC, Brier), evaluate candidate model on H_a
-        X_holdout_accepts = X_holdout[accept_indices]
+        # Step B: Compute accepts-only metrics using CANDIDATE model ranking on H_a
+        # Same ABR definition (20-40% integration) as Oracle/Bayesian, just biased sample
         scores_holdout_accepts = model.predict_proba(X_holdout_accepts)
         accepts_metrics = compute_metrics(
             y_holdout_accepts, scores_holdout_accepts,
-            ["auc", "pauc", "brier"], abr_range=abr_range
+            metrics_list, abr_range=abr_range
         )
-        # Override ABR with empirical bad rate (not ranking-based)
-        accepts_metrics["abr"] = accepts_abr
 
         # Compute model scores on ALL accepts (needed for Bayesian evaluation)
         scores_accepts = model.predict_proba(X_accepts)
