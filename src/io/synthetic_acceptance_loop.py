@@ -429,30 +429,24 @@ class AcceptanceLoop:
             y_holdout, model_scores_holdout, metrics_list, abr_range=abr_range
         )
 
-        # Accepts-only evaluation: evaluate on H_a (accepted portion of holdout)
-        # Per paper Figure 2(d):
-        # - H_a is defined by the BANK'S policy (baseline_model), not the candidate model
-        # - ABR uses the SAME 20-40% integration as Oracle/Bayesian, but on biased sample H_a
-        # - This makes accepts-only ABR model-dependent (ranking by candidate model)
-        # - The "double truncation" (bank α × ABR range) is the bias the paper illustrates
+        # Accepts-only evaluation: evaluate on D_a_val (validation subset from accepts)
+        # Per paper Appendix C.1/C.2:
+        # "f_a is evaluated on a validation subset drawn from the available set of accepts D_a"
+        # This is the BIASED estimator - it shows what performance you'd estimate
+        # if you only had access to accepted applicants (sampling bias).
         #
-        # Step A: Define H_a using bank policy (fixed across iterations)
-        baseline_scores_holdout = baseline_model.predict_proba(X_holdout)
-        n_holdout = len(X_holdout)
-        n_accept_holdout = max(1, int(n_holdout * self.cfg.target_accept_rate))
+        # Split D_a into train/val (80/20) for accepts-based evaluation
+        n_accepts = len(X_accepts)
+        n_val = max(1, int(n_accepts * 0.2))
+        val_indices = self.rng.choice(n_accepts, size=n_val, replace=False)
 
-        # H_a = samples in holdout that the bank would accept (lowest scores)
-        sorted_indices = np.argsort(baseline_scores_holdout)
-        accept_indices = sorted_indices[:n_accept_holdout]
+        X_accepts_val = X_accepts[val_indices]
+        y_accepts_val = y_accepts[val_indices]
 
-        X_holdout_accepts = X_holdout[accept_indices]
-        y_holdout_accepts = y_holdout[accept_indices]
-
-        # Step B: Compute accepts-only metrics using CANDIDATE model ranking on H_a
-        # Same ABR definition (20-40% integration) as Oracle/Bayesian, just biased sample
-        scores_holdout_accepts = model.predict_proba(X_holdout_accepts)
+        # Compute accepts-only metrics on D_a_val using candidate model
+        scores_accepts_val = model.predict_proba(X_accepts_val)
         accepts_metrics = compute_metrics(
-            y_holdout_accepts, scores_holdout_accepts,
+            y_accepts_val, scores_accepts_val,
             metrics_list, abr_range=abr_range
         )
 
