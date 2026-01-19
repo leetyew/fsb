@@ -46,6 +46,21 @@ from src.io.synthetic_acceptance_loop import AcceptanceLoop
 from src.io.synthetic_generator import SyntheticGenerator
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        if isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        return super().default(obj)
+
+
 # Global config loaded from YAML
 CONFIG: dict[str, Any] = {}
 
@@ -138,10 +153,11 @@ def collect_figure2_data(
         "oracle_intercept": float(lr_oracle.intercept_),
     }
 
-    # Panel (c): Raw XGB predicted probabilities on holdout (paper-faithful)
-    # Must use raw XGB scores, NOT LR surrogate scores (which cause 0/1 clip spikes)
-    accepts_scores = model.predict_proba(X_ref)  # Raw XGB P(bad)
-    oracle_scores = oracle_model.predict_proba(X_ref)  # Raw XGB P(bad)
+    # Panel (c): Credit scores on holdout (paper-faithful)
+    # Paper plots "score" in credit-scoring sense: higher = better applicant = P(GOOD)
+    # Transform: credit_score = 1 - P(BAD)
+    accepts_scores = 1.0 - model.predict_proba(X_ref)  # Credit score (P(good))
+    oracle_scores = 1.0 - oracle_model.predict_proba(X_ref)  # Credit score (P(good))
 
     panel_c_data = {
         "accepts_scores": accepts_scores.tolist(),
@@ -340,17 +356,17 @@ def main():
         }
         trial_path = exp_dir / f"trial_seed{seed}.json"
         with open(trial_path, "w") as f:
-            json.dump(trial_summary, f, indent=2)
+            json.dump(trial_summary, f, indent=2, cls=NumpyEncoder)
 
         # Save full metrics history separately for Figure 2 panel (d)
         history_path = exp_dir / f"metrics_history_seed{seed}.json"
         with open(history_path, "w") as f:
-            json.dump(trial["metrics_history"], f, indent=2)
+            json.dump(trial["metrics_history"], f, indent=2, cls=NumpyEncoder)
 
         # Save Figure 2 panel data (a, b, c) separately
         figure2_path = exp_dir / f"figure2_data_seed{seed}.json"
         with open(figure2_path, "w") as f:
-            json.dump(trial["figure2_data"], f, indent=2)
+            json.dump(trial["figure2_data"], f, indent=2, cls=NumpyEncoder)
 
     # Aggregate results (final iteration)
     aggregated = {
@@ -375,7 +391,7 @@ def main():
     }
 
     with open(exp_dir / "aggregated.json", "w") as f:
-        json.dump(aggregated, f, indent=2)
+        json.dump(aggregated, f, indent=2, cls=NumpyEncoder)
 
     # Print summary
     print("\n" + "=" * 70)

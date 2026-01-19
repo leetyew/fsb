@@ -57,6 +57,21 @@ from src.models.xgboost_model import XGBoostModel
 from src.basl.labeling import label_rejects_iteration
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        if isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        return super().default(obj)
+
+
 # Global config loaded from YAML
 CONFIG: dict[str, Any] = {}
 
@@ -112,11 +127,12 @@ def collect_basl_surrogate_data(
     lr_oracle = LinearRegression().fit(X_ref, oracle_targets)
     lr_accepts = LinearRegression().fit(X_ref, accepts_targets)
 
-    # Panel (c): Raw XGB predicted probabilities (paper-faithful)
-    # Must use raw XGB scores, NOT LR surrogate scores (which cause 0/1 clip spikes)
-    basl_scores = basl_targets  # Already computed above as raw XGB P(bad)
-    oracle_scores = oracle_targets
-    accepts_scores = accepts_targets
+    # Panel (c): Credit scores (paper-faithful)
+    # Paper plots "score" in credit-scoring sense: higher = better applicant = P(GOOD)
+    # Transform: credit_score = 1 - P(BAD)
+    basl_scores = 1.0 - basl_targets  # Credit score (P(good))
+    oracle_scores = 1.0 - oracle_targets  # Credit score (P(good))
+    accepts_scores = 1.0 - accepts_targets  # Credit score (P(good))
 
     # Paper Figure 2(b) x-axis order: Intercept, X1, X2, N1, N2
     return {
@@ -178,7 +194,7 @@ def train_basl_lr_for_diagnostics(
         if len(X_rejects_pool) == 0:
             break
 
-        X_pseudo, y_pseudo, remaining_mask, _ = label_rejects_iteration(
+        X_pseudo, y_pseudo, remaining_mask, _, _ = label_rejects_iteration(
             X_labeled=X_labeled,
             y_labeled=y_labeled,
             X_rejects_pool=X_rejects_pool,
@@ -520,26 +536,26 @@ def main():
         # Save individual trial summary
         trial_path = exp_dir / f"trial_seed{seed}.json"
         with open(trial_path, "w") as f:
-            json.dump(trial, f, indent=2)
+            json.dump(trial, f, indent=2, cls=NumpyEncoder)
 
         # Save full metrics history separately for Figures 3-4
         history_path = exp_dir / f"metrics_history_seed{seed}.json"
         with open(history_path, "w") as f:
-            json.dump(metrics_history, f, indent=2)
+            json.dump(metrics_history, f, indent=2, cls=NumpyEncoder)
 
     # Save feature bias analysis (for Figure 4)
     with open(exp_dir / "feature_bias_analysis.json", "w") as f:
-        json.dump(all_feature_bias, f, indent=2)
+        json.dump(all_feature_bias, f, indent=2, cls=NumpyEncoder)
 
     # Save BASL-LR data (for Figure 2 bridge panels b and c) - legacy
     all_basl_lr = [t["basl_lr_data"] for t in trials]
     with open(exp_dir / "basl_lr_data.json", "w") as f:
-        json.dump(all_basl_lr, f, indent=2)
+        json.dump(all_basl_lr, f, indent=2, cls=NumpyEncoder)
 
     # Save paper-faithful Panel (b) surrogate data (LinearRegression on XGB predictions)
     all_panel_b_surrogates = [t["panel_b_surrogate_data"] for t in trials]
     with open(exp_dir / "panel_b_surrogate_data.json", "w") as f:
-        json.dump(all_panel_b_surrogates, f, indent=2)
+        json.dump(all_panel_b_surrogates, f, indent=2, cls=NumpyEncoder)
 
     # Aggregate results (Table 2)
     def mean_std(key):
@@ -559,7 +575,7 @@ def main():
             aggregated[f"{key}_std"] = std
 
     with open(exp_dir / "aggregated.json", "w") as f:
-        json.dump(aggregated, f, indent=2)
+        json.dump(aggregated, f, indent=2, cls=NumpyEncoder)
 
     # Print summary (Table 2 format)
     print("\n" + "=" * 70)
