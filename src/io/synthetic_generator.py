@@ -54,8 +54,16 @@ class SyntheticGenerator:
         self._weight_good = self._weight_good / self._weight_good.sum()
         self._weight_bad = self._weight_bad / self._weight_bad.sum()
 
-        # Generate covariance for informative features (shared across components)
-        self._sigma_info = self._generate_informative_covariance(gm.sigma_max)
+        # Generate SEPARATE covariance for each (class, component)
+        # Paper-faithful: each component has its own Σ with entries ~ U(0, sigma_max)
+        self._sigma_good = [
+            self._generate_informative_covariance(gm.sigma_max),
+            self._generate_informative_covariance(gm.sigma_max),
+        ]
+        self._sigma_bad = [
+            self._generate_informative_covariance(gm.sigma_max),
+            self._generate_informative_covariance(gm.sigma_max),
+        ]
 
         # Determine x_v: feature with largest mean separation
         self._x_v_feature = self._find_most_separating_feature()
@@ -73,25 +81,27 @@ class SyntheticGenerator:
     def _generate_informative_covariance(self, sigma_max: float) -> np.ndarray:
         """Generate PSD covariance for informative features per paper.
 
-        Per Appendix E.1: Covariance entries drawn from U(0, σ_max).
+        Paper-faithful: sample variances from U(0, σ_max) and correlation from
+        U(-1, 1), then construct a valid covariance matrix.
 
-        For 2x2 matrix, Σ = [[a, b], [b, c]] is PSD iff a >= 0, c >= 0, b² <= ac.
-        We use direct PSD sampling (Option A) which guarantees PSD by construction
-        without artificial eigenvalue floors.
+        This produces random, non-degenerate geometry with varied correlations
+        (both positive and negative), matching the paper's intent of
+        "random covariance matrices" without systematic high correlation.
         """
-        n_info = len(self.INFORMATIVE_FEATURES)
-        assert n_info == 2, "Direct PSD sampling assumes 2 informative features"
+        # Sample variances (diagonal elements) from U(0.1*sigma_max, sigma_max)
+        # Lower bound ensures non-degenerate variances
+        var1 = self.rng.uniform(0.1 * sigma_max, sigma_max)
+        var2 = self.rng.uniform(0.1 * sigma_max, sigma_max)
 
-        # Sample diagonal entries from U(0, σ_max)
-        a = self.rng.uniform(0, sigma_max)
-        c = self.rng.uniform(0, sigma_max)
+        # Sample correlation from U(-0.8, 0.8) to allow varied correlations
+        # while keeping the matrix well-conditioned
+        corr = self.rng.uniform(-0.8, 0.8)
 
-        # Sample off-diagonal from U(0, min(sqrt(ac), σ_max)) to guarantee PSD
-        # b² <= ac ensures positive semi-definiteness
-        max_b = min(np.sqrt(a * c), sigma_max)
-        b = self.rng.uniform(0, max_b) if max_b > 0 else 0.0
+        # Construct covariance: cov12 = corr * sqrt(var1 * var2)
+        cov12 = corr * np.sqrt(var1 * var2)
 
-        cov = np.array([[a, b], [b, c]])
+        cov = np.array([[var1, cov12], [cov12, var2]])
+
         return cov
 
     def _find_most_separating_feature(self) -> str:
@@ -147,9 +157,10 @@ class SyntheticGenerator:
                 comp_mask = components_good == comp
                 n_comp = comp_mask.sum()
                 if n_comp > 0:
+                    # Paper-faithful: use per-component covariance
                     informative[np.where(mask_good)[0][comp_mask]] = (
                         self.rng.multivariate_normal(
-                            self._mu_good[comp], self._sigma_info, size=n_comp
+                            self._mu_good[comp], self._sigma_good[comp], size=n_comp
                         )
                     )
 
@@ -165,9 +176,10 @@ class SyntheticGenerator:
                 comp_mask = components_bad == comp
                 n_comp = comp_mask.sum()
                 if n_comp > 0:
+                    # Paper-faithful: use per-component covariance
                     informative[np.where(mask_bad)[0][comp_mask]] = (
                         self.rng.multivariate_normal(
-                            self._mu_bad[comp], self._sigma_info, size=n_comp
+                            self._mu_bad[comp], self._sigma_bad[comp], size=n_comp
                         )
                     )
 

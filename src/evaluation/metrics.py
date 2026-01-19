@@ -10,7 +10,7 @@ Implements:
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 from sklearn.metrics import brier_score_loss, roc_auc_score, roc_curve
@@ -93,6 +93,92 @@ def compute_brier(y_true: np.ndarray, y_score: np.ndarray) -> float:
         Brier score in [0, 1].
     """
     return float(brier_score_loss(y_true, y_score))
+
+
+def compute_abr_breakdown(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    accept_rate_min: float = 0.2,
+    accept_rate_max: float = 0.4,
+    n_points: int = 21,
+) -> Dict[str, Any]:
+    """Compute ABR breakdown with detailed diagnostics.
+
+    Returns detailed information about the ABR computation for verification,
+    including both mean and trapezoidal integration methods (TWEAK 2).
+
+    Args:
+        y_true: True binary labels (0=good, 1=bad).
+        y_score: Predicted probability of bad (y=1).
+        accept_rate_min: Minimum acceptance rate for integration (default 0.2).
+        accept_rate_max: Maximum acceptance rate for integration (default 0.4).
+        n_points: Number of points for numerical integration (default 21).
+
+    Returns:
+        Dictionary containing:
+        - accept_rates: List of acceptance rate grid points
+        - bad_rates: List of bad rates at each level
+        - integrated_abr_mean: Mean of bad_rates (primary metric)
+        - integrated_abr_trapz: trapz normalized by range (secondary, verification)
+        - k_values: Number of accepts at each level
+        - n_total: Total number of samples
+        - note: Description of primary metric
+    """
+    # Validate inputs
+    if len(y_true) == 0 or len(y_score) == 0:
+        return {
+            "accept_rates": [],
+            "bad_rates": [],
+            "integrated_abr_mean": float("nan"),
+            "integrated_abr_trapz": float("nan"),
+            "k_values": [],
+            "n_total": 0,
+            "note": "Empty input",
+        }
+
+    if len(y_true) != len(y_score):
+        raise ValueError(f"Shape mismatch: y_true={len(y_true)}, y_score={len(y_score)}")
+
+    # Check for finite scores
+    if not np.all(np.isfinite(y_score)):
+        n_nonfinite = (~np.isfinite(y_score)).sum()
+        raise ValueError(f"{n_nonfinite} non-finite scores detected")
+
+    # Sort by score ascending (lowest PD first = best applicants)
+    sorted_indices = np.argsort(y_score)
+    y_sorted = y_true[sorted_indices]
+    n_total = len(y_true)
+
+    # Compute bad rate at each acceptance threshold
+    accept_rates = np.linspace(accept_rate_min, accept_rate_max, n_points)
+    bad_rates = []
+    k_values = []
+
+    for rate in accept_rates:
+        # Use ceil to ensure at least 1 accept at min rate
+        k = max(1, int(np.ceil(rate * n_total)))
+        k_values.append(k)
+        bad_rate = float(y_sorted[:k].mean())
+        bad_rates.append(bad_rate)
+
+    # TWEAK 2: Compute BOTH integration methods
+    # Primary: arithmetic mean (simple average over grid)
+    integrated_abr_mean = float(np.mean(bad_rates))
+
+    # Secondary: trapezoidal integration normalized by range width
+    integrated_abr_trapz = float(
+        np.trapz(bad_rates, accept_rates) / (accept_rate_max - accept_rate_min)
+    )
+
+    return {
+        "accept_rates": [float(r) for r in accept_rates],
+        "bad_rates": [float(br) for br in bad_rates],
+        "integrated_abr_mean": integrated_abr_mean,
+        "integrated_abr_trapz": integrated_abr_trapz,
+        "k_values": k_values,
+        "n_total": n_total,
+        "note": "mean over grid (primary)",
+    }
 
 
 def compute_abr(

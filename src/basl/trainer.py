@@ -8,12 +8,12 @@ Provides methods for iterative pseudo-labeling integrated with AcceptanceLoop:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from src.basl.filtering import filter_rejects
-from src.basl.labeling import label_rejects_iteration
+from src.basl.labeling import BASLIterationStats, label_rejects_iteration
 from src.config import BASLConfig
 
 
@@ -31,6 +31,7 @@ class BASLTrainer:
         self.cfg = cfg
         self.rng = np.random.default_rng(cfg.labeling.random_seed)
         self._fixed_thresholds: Optional[Tuple[float, float]] = None
+        self._iteration_stats: List[BASLIterationStats] = []  # Diagnostic stats per iteration
 
     def filter_rejects_once(
         self,
@@ -60,7 +61,7 @@ class BASLTrainer:
         """Perform one iteration of pseudo-labeling.
 
         Called iteratively by AcceptanceLoop. Thresholds are fixed after
-        the first call.
+        the first call. Stats are tracked internally for diagnostic access.
 
         Args:
             X_labeled: Current labeled features (accepts + pseudo-labeled rejects).
@@ -82,7 +83,7 @@ class BASLTrainer:
                 self._fixed_thresholds or (0.0, 1.0),
             )
 
-        X_new, y_new, remaining_indices, thresholds = label_rejects_iteration(
+        X_new, y_new, remaining_indices, thresholds, stats = label_rejects_iteration(
             X_labeled=X_labeled,
             y_labeled=y_labeled,
             X_rejects_pool=X_rejects_pool,
@@ -91,12 +92,24 @@ class BASLTrainer:
             fixed_thresholds=self._fixed_thresholds,
         )
 
+        # Track stats for diagnostics
+        self._iteration_stats.append(stats)
+
         # Fix thresholds after first iteration
         if self._fixed_thresholds is None:
             self._fixed_thresholds = thresholds
 
         return X_new, y_new, remaining_indices, thresholds
 
+    def get_iteration_stats(self) -> List[BASLIterationStats]:
+        """Return the list of iteration stats for diagnostics."""
+        return self._iteration_stats.copy()
+
+    def get_last_stats(self) -> Optional[BASLIterationStats]:
+        """Return the last iteration stats, or None if no iterations have run."""
+        return self._iteration_stats[-1] if self._iteration_stats else None
+
     def reset_thresholds(self) -> None:
         """Reset fixed thresholds for a new training session."""
         self._fixed_thresholds = None
+        self._iteration_stats = []

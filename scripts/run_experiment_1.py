@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
+from sklearn.linear_model import LinearRegression
 from tqdm import tqdm
 
 from src.config import (
@@ -43,7 +44,6 @@ from src.config import (
 )
 from src.io.synthetic_acceptance_loop import AcceptanceLoop
 from src.io.synthetic_generator import SyntheticGenerator
-from src.models.logistic_regression import LogisticRegressionConfig, LogisticRegressionModel
 
 
 # Global config loaded from YAML
@@ -71,17 +71,23 @@ def collect_figure2_data(
     """Collect data for Figure 2 panels (a), (b), (c) - Experiment I diagnostic data.
 
     Panel (a): x_v (most separating feature, e.g. X1) distributions
-    Panel (b): LR coefficients on ALL 4 features (X1, X2, N1, N2) + Intercept
-    Panel (c): LR score distributions (accepts-only vs oracle)
+    Panel (b): LinearRegression surrogate coefficients on XGB predictions (paper-faithful)
+    Panel (c): LinearRegression surrogate score distributions
 
-    Note: BASL models are NOT included in Experiment I. They come from Experiment II.
+    Paper-faithful: Per Figure 2(b), we fit LinearRegression to predict XGB scores
+    from features. This reveals which features the XGB models rely on.
+    - Reference dataset: holdout H (independent of training)
+    - Targets: XGB.predict_proba(H) - continuous scores, NOT labels
+    - Features: [X1, X2, N1, N2] - ALL features
+
+    Note: BASL surrogate is NOT included here (comes from Experiment II).
 
     Args:
         D_a: Accepts dataframe with features and labels
         D_r: Rejects dataframe with features and labels
-        holdout: Holdout dataframe
-        model: Accepts-only model (XGBoost) - not used for panels b,c
-        oracle_model: Oracle model (XGBoost) - not used for panels b,c
+        holdout: Holdout dataframe (reference dataset for surrogate fitting)
+        model: Accepts-only XGBoost (f_a) - used for surrogate target
+        oracle_model: Oracle XGBoost (f_o) - used for surrogate target
         generator: Data generator for population sample
         feature_cols: List of feature column names [X1, X2, N1, N2]
 
@@ -100,45 +106,46 @@ def collect_figure2_data(
         "rejects_x_v": D_r[x_v_feature].tolist(),
     }
 
-    # Panel (b): Model coefficients using ALL 4 features (paper Figure 2b)
-    # Paper x-axis: Intercept, X1, X2, N1, N2
-    lr_feature_cols = feature_cols  # [X1, X2, N1, N2]
-    X_a = D_a[lr_feature_cols].values
-    y_a = D_a["y"].values
-    X_r = D_r[lr_feature_cols].values
-    y_r = D_r["y"].values
+    # Panel (b): LinearRegression surrogates on XGB predictions (paper Figure 2b)
+    # Paper-faithful: fit LinearRegression on holdout to approximate XGB
+    # x-axis shows: Intercept, X1, X2, N1, N2
+    lr_feature_cols = feature_cols  # [X1, X2, N1, N2] - include ALL features
 
-    lr_cfg = LogisticRegressionConfig(C=1.0, penalty="l2", solver="lbfgs")
+    # Reference dataset = holdout H (paper-faithful: independent test set)
+    X_ref = holdout[lr_feature_cols].values
 
-    # Accepts-only LR model (surrogate for XGB)
-    lr_accepts = LogisticRegressionModel(lr_cfg)
-    lr_accepts.fit(X_a, y_a)
+    # Continuous surrogate targets: XGB scores on holdout - MUST be 1D
+    accepts_targets = model.predict_proba(X_ref).reshape(-1)
+    oracle_targets = oracle_model.predict_proba(X_ref).reshape(-1)
 
-    # Oracle LR model (trained on full data)
-    lr_oracle = LogisticRegressionModel(lr_cfg)
-    X_all = np.vstack([X_a, X_r])
-    y_all = np.concatenate([y_a, y_r])
-    lr_oracle.fit(X_all, y_all)
+    # Fit LinearRegression surrogates (NOT LogisticRegression)
+    # This approximates what features the XGB models rely on
+    lr_accepts = LinearRegression().fit(X_ref, accepts_targets)
+    lr_oracle = LinearRegression().fit(X_ref, oracle_targets)
 
     # Paper Figure 2(b) x-axis order: Intercept, X1, X2, N1, N2
+    # Coefficients reveal feature importance: noise features should be ~0 for oracle
     panel_b_data = {
         "feature_names": ["Intercept"] + lr_feature_cols,  # Paper order
         "lr_features": lr_feature_cols,
-        "accepts_coefficients": lr_accepts._model.coef_[0].tolist(),
-        "accepts_intercept": float(lr_accepts._model.intercept_[0]),
-        "oracle_coefficients": lr_oracle._model.coef_[0].tolist(),
-        "oracle_intercept": float(lr_oracle._model.intercept_[0]),
+        # Store as [intercept, coef1, coef2, ...] for easy plotting
+        "accepts_coefs": [float(lr_accepts.intercept_)] + lr_accepts.coef_.tolist(),
+        "oracle_coefs": [float(lr_oracle.intercept_)] + lr_oracle.coef_.tolist(),
+        # Legacy fields for backwards compatibility
+        "accepts_coefficients": lr_accepts.coef_.tolist(),
+        "accepts_intercept": float(lr_accepts.intercept_),
+        "oracle_coefficients": lr_oracle.coef_.tolist(),
+        "oracle_intercept": float(lr_oracle.intercept_),
     }
 
-    # Panel (c): LR score distributions on holdout
-    X_holdout = holdout[lr_feature_cols].values
-
-    accepts_scores_lr = lr_accepts.predict_proba(X_holdout)
-    oracle_scores_lr = lr_oracle.predict_proba(X_holdout)
+    # Panel (c): Raw XGB predicted probabilities on holdout (paper-faithful)
+    # Must use raw XGB scores, NOT LR surrogate scores (which cause 0/1 clip spikes)
+    accepts_scores = model.predict_proba(X_ref)  # Raw XGB P(bad)
+    oracle_scores = oracle_model.predict_proba(X_ref)  # Raw XGB P(bad)
 
     panel_c_data = {
-        "accepts_scores": accepts_scores_lr.tolist(),
-        "oracle_scores": oracle_scores_lr.tolist(),
+        "accepts_scores": accepts_scores.tolist(),
+        "oracle_scores": oracle_scores.tolist(),
     }
 
     return {

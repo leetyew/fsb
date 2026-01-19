@@ -23,9 +23,15 @@ acceptance_loop:
   acceptance_mode: "model"  # Model-based for Exp II (creates feedback loop for BASL)
 
 basl:
-  filter_proportion: 0.15  # rho = 0.1-0.3, default ~0.15
-  max_iterations: 3        # j_max = 3 per paper Appendix E.1 (conservative BASL)
-  pseudo_threshold: 0.5
+  # Paper-faithful BASL parameters from Appendix E.1
+  max_iterations: 3        # j_max = 3 per paper Appendix E.1
+  filtering:
+    beta_lower: 0.05       # β_lower: remove bottom 5% outliers
+    beta_upper: 1.0        # β_upper: no upper filtering
+  labeling:
+    subsample_ratio: 0.8   # ρ = 0.8 for synthetic experiments
+    gamma: 0.01            # γ = 0.01 percentile threshold
+    theta: 2.0             # θ = 2.0 imbalance multiplier
 
 xgboost:
   n_estimators: 100

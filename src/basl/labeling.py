@@ -7,12 +7,33 @@ confident rejects based on percentile thresholds.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
 
 from src.config import BASLLabelingConfig
 from src.models.logistic_regression import LogisticRegressionConfig, LogisticRegressionModel
+
+
+@dataclass
+class BASLIterationStats:
+    """Statistics from a single BASL labeling iteration.
+
+    Tracks threshold values and counts for diagnostic verification.
+    Paper-faithful invariant: thresholds must be fixed after iteration 1.
+    """
+
+    tau_good: float               # Bottom γ percentile threshold (score <= tau_good -> good)
+    tau_bad: float                # Top γθ percentile threshold (score >= tau_bad -> bad)
+    n_labeled_good: int           # Number of rejects labeled as good
+    n_labeled_bad: int            # Number of rejects labeled as bad
+    thresholds_recomputed: bool   # True only if thresholds were computed this iteration
+    remaining_pool_size: int      # Size of reject pool after labeling
+    n_subsampled: int             # Number of rejects subsampled this iteration
+    score_min: float              # Min score among subsampled rejects
+    score_max: float              # Max score among subsampled rejects
+    score_mean: float             # Mean score among subsampled rejects
 
 
 def label_rejects_iteration(
@@ -22,7 +43,7 @@ def label_rejects_iteration(
     cfg: BASLLabelingConfig,
     rng: np.random.Generator,
     fixed_thresholds: Optional[Tuple[float, float]] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[float, float]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[float, float], BASLIterationStats]:
     """Perform one iteration of pseudo-labeling on rejects.
 
     Steps:
@@ -42,20 +63,35 @@ def label_rejects_iteration(
             new ones. Should be (tau_good, tau_bad) from first iteration.
 
     Returns:
-        Tuple of (X_new, y_new, remaining_indices, thresholds):
+        Tuple of (X_new, y_new, remaining_indices, thresholds, stats):
         - X_new: Features of newly labeled rejects.
         - y_new: Pseudo-labels for newly labeled rejects.
         - remaining_indices: Indices of rejects still in pool (not labeled).
         - thresholds: (tau_good, tau_bad) thresholds used this iteration.
+        - stats: BASLIterationStats with diagnostic information.
     """
     n_pool = len(X_rejects_pool)
     if n_pool == 0:
         # No rejects left to label
+        thresholds = fixed_thresholds or (0.0, 1.0)
+        stats = BASLIterationStats(
+            tau_good=thresholds[0],
+            tau_bad=thresholds[1],
+            n_labeled_good=0,
+            n_labeled_bad=0,
+            thresholds_recomputed=False,
+            remaining_pool_size=0,
+            n_subsampled=0,
+            score_min=float("nan"),
+            score_max=float("nan"),
+            score_mean=float("nan"),
+        )
         return (
             np.array([]).reshape(0, X_labeled.shape[1]),
             np.array([]),
             np.array([]),
-            fixed_thresholds or (0.0, 1.0),
+            thresholds,
+            stats,
         )
 
     # Step 1: Subsample rejects
@@ -72,10 +108,11 @@ def label_rejects_iteration(
     scores = weak_learner.predict_proba(X_subsample)
 
     # Step 4: Compute or use fixed thresholds
+    thresholds_recomputed = fixed_thresholds is None
     if fixed_thresholds is None:
         # First iteration: compute thresholds from score distribution
-        tau_good = np.percentile(scores, cfg.gamma * 100)
-        tau_bad = np.percentile(scores, (1 - cfg.theta * cfg.gamma) * 100)
+        tau_good = float(np.percentile(scores, cfg.gamma * 100))
+        tau_bad = float(np.percentile(scores, (1 - cfg.theta * cfg.gamma) * 100))
         thresholds = (tau_good, tau_bad)
     else:
         tau_good, tau_bad = fixed_thresholds
@@ -85,6 +122,10 @@ def label_rejects_iteration(
     good_mask = scores <= tau_good
     bad_mask = scores >= tau_bad
     labeled_mask = good_mask | bad_mask
+
+    # Count labels before extracting data
+    n_labeled_good = int(good_mask.sum())
+    n_labeled_bad = int(bad_mask.sum())
 
     # Extract newly labeled data
     X_new_list = []
@@ -114,4 +155,18 @@ def label_rejects_iteration(
     remaining_mask[labeled_subsample_indices] = False
     remaining_indices = np.where(remaining_mask)[0]
 
-    return X_new, y_new, remaining_indices, thresholds
+    # Build stats object for diagnostics
+    stats = BASLIterationStats(
+        tau_good=tau_good,
+        tau_bad=tau_bad,
+        n_labeled_good=n_labeled_good,
+        n_labeled_bad=n_labeled_bad,
+        thresholds_recomputed=thresholds_recomputed,
+        remaining_pool_size=len(remaining_indices),
+        n_subsampled=n_subsample,
+        score_min=float(scores.min()),
+        score_max=float(scores.max()),
+        score_mean=float(scores.mean()),
+    )
+
+    return X_new, y_new, remaining_indices, thresholds, stats

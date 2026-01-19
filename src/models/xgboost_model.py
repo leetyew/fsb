@@ -21,9 +21,8 @@ class XGBoostModel:
     credit scoring. Outputs probability of default (PD) which is
     then used with an α-percentile cutoff for acceptance decisions.
 
-    Uses early stopping with a validation split to prevent overfitting,
-    which is important when training on BASL-augmented data with
-    pseudo-labeled rejects.
+    Paper-faithful (Table E.8): No early stopping for synthetic experiments.
+    Uses fixed 100 trees with subsample=0.8 and colsample=0.8.
     """
 
     def __init__(self, cfg: XGBoostConfig) -> None:
@@ -31,10 +30,10 @@ class XGBoostModel:
         self._model: xgb.XGBClassifier | None = None
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Train the model on labeled data with early stopping.
+        """Train the model on labeled data.
 
-        Splits data into train/validation for early stopping to prevent
-        overfitting, especially important for BASL-augmented training.
+        Paper-faithful (Table E.8): No early stopping, no validation split.
+        Uses full training data with fixed number of trees.
 
         Args:
             X: Feature matrix of shape (n_samples, n_features).
@@ -49,26 +48,10 @@ class XGBoostModel:
             random_state=self.cfg.random_seed,
             objective="binary:logistic",
             eval_metric="auc",
-            early_stopping_rounds=self.cfg.early_stopping_rounds,
+            # No early_stopping_rounds per Table E.8 (synthetic)
         )
-
-        # Split data for early stopping validation
-        if len(X) > 50 and self.cfg.validation_fraction > 0:
-            X_train, X_val, y_train, y_val = train_test_split(
-                X, y,
-                test_size=self.cfg.validation_fraction,
-                random_state=self.cfg.random_seed,
-                stratify=y if len(np.unique(y)) > 1 else None,
-            )
-            self._model.fit(
-                X_train, y_train,
-                eval_set=[(X_val, y_val)],
-                verbose=False,
-            )
-        else:
-            # Not enough data for split, train without early stopping
-            self._model.set_params(early_stopping_rounds=None)
-            self._model.fit(X, y)
+        # Train on full data without validation split
+        self._model.fit(X, y)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Return probability of default (PD) for each applicant.

@@ -8,7 +8,7 @@ Config files are stored in configs/ directory.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import yaml
 from pydantic import BaseModel, Field
@@ -91,7 +91,8 @@ class SyntheticDataConfig(BaseModel):
 class XGBoostConfig(BaseModel):
     """Configuration for XGBoost model.
 
-    Default values from paper Table E.9 (synthetic experiments).
+    Default values from paper Table E.8 (synthetic experiments).
+    Paper-faithful: NO early stopping for synthetic experiments.
     """
 
     n_estimators: int = 100
@@ -99,8 +100,8 @@ class XGBoostConfig(BaseModel):
     learning_rate: float = 0.1
     subsample: float = 0.8
     colsample_bytree: float = 0.8
-    early_stopping_rounds: int = 10  # Paper default for synthetic
-    validation_fraction: float = 0.2  # Fraction of training data for early stopping
+    early_stopping_rounds: Optional[int] = None  # Disabled per Table E.8 (synthetic)
+    validation_fraction: float = 0.0  # No validation split for synthetic
     random_seed: int = 42
 
     @classmethod
