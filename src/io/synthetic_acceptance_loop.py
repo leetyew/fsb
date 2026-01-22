@@ -284,7 +284,7 @@ class AcceptanceLoop:
         holdout: pd.DataFrame,
         track_every: int = 1,
         show_progress: bool = True,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, XGBoostModel, XGBoostModel, List[Dict[str, Any]]]:
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, XGBoostModel, XGBoostModel, XGBoostModel, List[Dict[str, Any]]]:
         """Run the integrated training and evaluation loop per Algorithm C.2.
 
         Per paper Section 6.1:
@@ -299,8 +299,10 @@ class AcceptanceLoop:
             show_progress: Whether to show tqdm progress bar.
 
         Returns:
-            (D_a, D_r, holdout, model, oracle_model, metrics_history)
-            where metrics_history contains oracle/accepts/bayesian metrics per iteration
+            (D_a, D_r, holdout, fc_model, fo_model, fa_model, metrics_history)
+            - fc_model: BASL model (or baseline if basl_cfg=None)
+            - fo_model: Oracle model trained on D_a ∪ D_r
+            - fa_model: Accepts-only model for panel(c) comparison
         """
         # Use feature columns from generator (paper-faithful: X1, X2, N1, N2)
         feature_cols = self.generator.feature_cols
@@ -419,6 +421,7 @@ class AcceptanceLoop:
             baseline_model,
             prior_calibrator,
             acceptance_diagnostics=None,  # No model-based acceptance at iter 0
+            n_Da_train=len(X_accepts_train),
         )
         metrics_history.append(initial_metrics)
 
@@ -557,6 +560,7 @@ class AcceptanceLoop:
                     baseline_model,
                     prior_calibrator,
                     acceptance_diagnostics=last_acceptance_diagnostics,  # Include diagnostics
+                    n_Da_train=len(X_accepts_train),
                 )
                 metrics_history.append(iteration_metrics)
 
@@ -593,7 +597,7 @@ class AcceptanceLoop:
             )
             print(f"  BASL: Using final model from iteration {self.cfg.n_periods} (pred_std={pred_std:.4f})")
 
-        return D_a, D_r, holdout, final_model, oracle_model, metrics_history
+        return D_a, D_r, holdout, final_model, oracle_model, accepts_only_model, metrics_history
 
     def _run_basl_labeling(
         self,
@@ -651,6 +655,7 @@ class AcceptanceLoop:
         baseline_model: Optional[XGBoostModel] = None,
         prior_calibrator: Optional[LogisticRegressionModel] = None,
         acceptance_diagnostics: Optional[AcceptanceDiagnostics] = None,
+        n_Da_train: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Five-way evaluation for Figure 2 with comprehensive diagnostics.
 
@@ -832,6 +837,22 @@ class AcceptanceLoop:
             },
         }
 
+        # Diagnostic dump for debugging panel (d) ABR issues
+        # Per checklist Section 6: gather key stats at checkpoint iterations
+        diagnostic = {
+            "n_Da_train": n_Da_train,
+            "n_Da_val": len(y_accepts_val),
+            "n_H": len(y_holdout),
+            "bad_rate_Da_val": float(y_accepts_val.mean()) if len(y_accepts_val) > 0 else float("nan"),
+            "bad_rate_H": float(y_holdout.mean()),
+            "count_bad_Da_val": int(y_accepts_val.sum()) if len(y_accepts_val) > 0 else 0,
+            "pred_Da_val_min": float(scores_accepts_val.min()) if len(scores_accepts_val) > 0 else float("nan"),
+            "pred_Da_val_p5": float(np.percentile(scores_accepts_val, 5)) if len(scores_accepts_val) > 0 else float("nan"),
+            "pred_Da_val_p50": float(np.percentile(scores_accepts_val, 50)) if len(scores_accepts_val) > 0 else float("nan"),
+            "pred_Da_val_p95": float(np.percentile(scores_accepts_val, 95)) if len(scores_accepts_val) > 0 else float("nan"),
+            "pred_Da_val_max": float(scores_accepts_val.max()) if len(scores_accepts_val) > 0 else float("nan"),
+        }
+
         # Paper-faithful metric naming convention:
         # - Panel (e) uses: fo_H, fa_H, fc_H (all evaluated on holdout H)
         # - Panel (d) uses: fa_DaVal (biased estimator on accepts validation set)
@@ -852,6 +873,14 @@ class AcceptanceLoop:
             "holdout_diagnostics": holdout_diagnostics,
             "abr_breakdown": abr_breakdown,
             "evaluation_datasets": evaluation_datasets,
+            "diagnostic": diagnostic,  # Panel (d) debug: dataset sizes, bad rates, pred stats
+            # Raw scores on holdout H for panel (c) snapshot selection
+            # These enable post-hoc KS distance computation and snapshot selection
+            "holdout_scores": {
+                "fo_scores_H": oracle_scores_holdout.tolist(),
+                "fa_scores_H": fa_scores_holdout.tolist(),
+                "fc_scores_H": fc_scores_holdout.tolist(),
+            },
             # DEPRECATED: kept for backward compatibility, remove after migration
             "oracle": fo_H_metrics,             # Use fo_H instead
             "model_holdout": fc_H_metrics,      # Use fc_H instead

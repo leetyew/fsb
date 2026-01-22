@@ -1,0 +1,51 @@
+# Unified Figure 2: All five panels from single acceptance loop
+# Per plan: Same parameters as experiment_2.yaml, plus figure2.checkpoints
+#
+# Data consistency guarantee: All panels use the SAME holdout H,
+# training snapshot (D_a, D_r), and models f_a, f_o, f_c.
+
+synthetic_data:
+  # Paper-faithful: 4 features (X1, X2 informative; N1, N2 noise)
+  # x_v = most separating feature (typically X1), part of X not separate
+  n_components: 2      # GMM components for feature distribution
+  bad_rate: 0.70       # 70% bad rate per paper Section 3.1
+  n_holdout: 3000      # Per paper Algorithm C.2
+
+acceptance_loop:
+  n_periods: 500       # j_max = 500 iterations
+  batch_size: 100      # n = 100 applicants per period
+  initial_batch_size: 100
+  target_accept_rate: 0.15  # alpha = 0.15
+  # x_v is determined by generator (most separating feature, typically X1)
+  acceptance_mode: "model"  # Model-based for Exp II (creates feedback loop for BASL)
+
+basl:
+  # Paper-faithful BASL parameters from Appendix E.1
+  max_iterations: 3        # j_max = 3 per paper Appendix E.1
+  filtering:
+    beta_lower: 0.05       # beta_lower: remove bottom 5% outliers
+    beta_upper: 1.0        # beta_upper: no upper filtering
+  labeling:
+    subsample_ratio: 0.8   # rho = 0.8 for synthetic experiments
+    gamma: 0.01            # gamma = 0.01 percentile threshold
+    theta: 2.0             # theta = 2.0 imbalance multiplier
+
+xgboost:
+  n_estimators: 100
+  max_depth: 3
+  learning_rate: 0.1
+
+logistic_regression:
+  # Used ONLY for BASL weak learner, not as scorecard
+  C: 1.0
+  penalty: "l2"
+  solver: "lbfgs"
+
+evaluation:
+  abr_range: [0.2, 0.4]  # ABR integrated over range per paper
+  n_bins: 10             # For Figure 4 feature bias analysis
+
+experiment:
+  n_seeds: 10            # Number of seeds to run (increase for statistical significance)
+  start_seed: 42         # First seed value
+  track_every: 1         # Track metrics every N iterations (all tracked iterations are output)

@@ -127,12 +127,11 @@ def collect_basl_surrogate_data(
     lr_oracle = LinearRegression().fit(X_ref, oracle_targets)
     lr_accepts = LinearRegression().fit(X_ref, accepts_targets)
 
-    # Panel (c): Credit scores (paper-faithful)
-    # Paper plots "score" in credit-scoring sense: higher = better applicant = P(GOOD)
-    # Transform: credit_score = 1 - P(BAD)
-    basl_scores = 1.0 - basl_targets  # Credit score (P(good))
-    oracle_scores = 1.0 - oracle_targets  # Credit score (P(good))
-    accepts_scores = 1.0 - accepts_targets  # Credit score (P(good))
+    # Panel (c): P(BAD) predictions (paper-faithful)
+    # Paper Figure 2(c) uses "Predicted P(BAD)" on x-axis: higher = worse applicant
+    basl_scores = basl_targets  # P(BAD) - paper convention
+    oracle_scores = oracle_targets  # P(BAD) - paper convention
+    accepts_scores = accepts_targets  # P(BAD) - paper convention
 
     # Paper Figure 2(b) x-axis order: Intercept, X1, X2, N1, N2
     return {

@@ -153,11 +153,10 @@ def collect_figure2_data(
         "oracle_intercept": float(lr_oracle.intercept_),
     }
 
-    # Panel (c): Credit scores on holdout (paper-faithful)
-    # Paper plots "score" in credit-scoring sense: higher = better applicant = P(GOOD)
-    # Transform: credit_score = 1 - P(BAD)
-    accepts_scores = 1.0 - model.predict_proba(X_ref)  # Credit score (P(good))
-    oracle_scores = 1.0 - oracle_model.predict_proba(X_ref)  # Credit score (P(good))
+    # Panel (c): P(BAD) predictions on holdout (paper-faithful)
+    # Paper Figure 2(c) uses "Predicted P(BAD)" on x-axis: higher = worse applicant
+    accepts_scores = model.predict_proba(X_ref)  # P(BAD) - paper convention
+    oracle_scores = oracle_model.predict_proba(X_ref)  # P(BAD) - paper convention
 
     panel_c_data = {
         "accepts_scores": accepts_scores.tolist(),
