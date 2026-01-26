@@ -1,54 +1,37 @@
-# Experiment II: BASL Training Effectiveness (Figures 3-4, Table 2)
-# Per docs/experiments.md Section 2 and docs/hyperparameters.md
+# Experiment II: Training Comparison (Table 3)
+# Backend-agnostic framework - consumes static CSV bundle
 #
-# Uses AcceptanceLoop: 500 periods × 100 applicants per batch
-# All scorecards (f_a, f_o, f_c) are XGBoost per Appendix E.1
-# LR used ONLY for BASL weak learner (pseudo-labeling)
-#
-# CRITICAL: BASL pseudo-labels are ephemeral and discarded each iteration
-
-synthetic_data:
-  # Paper-faithful: 4 features (X1, X2 informative; N1, N2 noise)
-  # x_v = most separating feature (typically X1), part of X not separate
-  n_components: 2      # GMM components for feature distribution
-  bad_rate: 0.70       # 70% bad rate per paper Section 3.1
-  n_holdout: 3000      # Per paper Algorithm C.2
-
-acceptance_loop:
-  n_periods: 500       # j_max = 500 iterations
-  batch_size: 100      # n = 100 applicants per period
-  initial_batch_size: 100
-  target_accept_rate: 0.15  # alpha = 0.15
-  # x_v is determined by generator (most separating feature, typically X1)
-  acceptance_mode: "model"  # Model-based for Exp II (creates feedback loop for BASL)
-
-basl:
-  # Paper-faithful BASL parameters from Appendix E.1
-  max_iterations: 3        # j_max = 3 per paper Appendix E.1
-  filtering:
-    beta_lower: 0.05       # β_lower: remove bottom 5% outliers
-    beta_upper: 1.0        # β_upper: no upper filtering
-  labeling:
-    subsample_ratio: 0.8   # ρ = 0.8 for synthetic experiments
-    gamma: 0.01            # γ = 0.01 percentile threshold
-    theta: 2.0             # θ = 2.0 imbalance multiplier
+# Compares accepts-only vs BASL training methods
+# All models evaluated on H_boot only
 
 xgboost:
   n_estimators: 100
   max_depth: 3
   learning_rate: 0.1
+  subsample: 0.8
+  colsample_bytree: 0.8
 
-logistic_regression:
-  # Used ONLY for BASL weak learner, not as scorecard
-  C: 1.0
-  penalty: "l2"
-  solver: "lbfgs"
+basl:
+  max_iterations: 3
+  filtering:
+    beta_lower: 0.05
+    beta_upper: 1.0
+  labeling:
+    subsample_ratio: 0.8
+    gamma: 0.01
+    theta: 2.0
 
-evaluation:
-  abr_range: [0.2, 0.4]  # ABR integrated over range per paper
-  n_bins: 10             # For Figure 4 feature bias analysis
+# Threshold specification for ABR/pAUC metrics
+# Per paper Section 6.3: ABR integrates over acceptance [0.2, 0.4]
+# pAUC uses max_fnr=0.2 (top 80% recall region)
+thresholds:
+  abr_range: [0.2, 0.4]
+  pauc_max_fnr: 0.2
+  policy: fixed_value
 
-experiment:
-  n_seeds: 10
-  start_seed: 42
-  track_every: 50        # Record metrics every 50 iterations for Figures 3-4
+replicates:
+  n_folds: 4
+  n_bootstraps: 25
+  # Total: 4 x 25 = 100 replicates
+
+random_seed: 42

@@ -10,10 +10,12 @@ Implements:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from sklearn.metrics import brier_score_loss, roc_auc_score, roc_curve
+
+from src.evaluation.thresholds import ThresholdSpec
 
 
 def compute_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -233,7 +235,8 @@ def compute_metrics(
     y_true: np.ndarray,
     y_score: np.ndarray,
     metrics: List[str],
-    abr_range: Tuple[float, float] = (0.2, 0.4),
+    threshold_spec: Optional[ThresholdSpec] = None,
+    abr_range: Optional[Tuple[float, float]] = None,
 ) -> Dict[str, float]:
     """Compute multiple evaluation metrics.
 
@@ -242,19 +245,33 @@ def compute_metrics(
         y_score: Predicted probability of bad (y=1).
         metrics: List of metric names to compute.
             Supported: "auc", "pauc", "brier", "abr".
+        threshold_spec: ThresholdSpec with ABR range and pAUC parameters.
+            If provided, takes precedence over abr_range.
         abr_range: (min, max) acceptance rate range for ABR integration.
-            Per paper Section 6.3, default is (0.2, 0.4).
+            Deprecated: use threshold_spec instead.
 
     Returns:
         Dictionary mapping metric name to value.
     """
+    # Resolve thresholds: prefer ThresholdSpec, fall back to abr_range for compatibility
+    if threshold_spec is not None:
+        _abr_range = threshold_spec.abr_range
+        _pauc_max_fnr = threshold_spec.pauc_max_fnr
+    elif abr_range is not None:
+        _abr_range = abr_range
+        _pauc_max_fnr = 0.2  # Legacy default
+    else:
+        # Use paper defaults
+        _abr_range = (0.2, 0.4)
+        _pauc_max_fnr = 0.2
+
     results = {}
 
     metric_funcs = {
         "auc": lambda: compute_auc(y_true, y_score),
-        "pauc": lambda: compute_pauc(y_true, y_score),
+        "pauc": lambda: compute_pauc(y_true, y_score, max_fnr=_pauc_max_fnr),
         "brier": lambda: compute_brier(y_true, y_score),
-        "abr": lambda: compute_abr(y_true, y_score, abr_range[0], abr_range[1]),
+        "abr": lambda: compute_abr(y_true, y_score, _abr_range[0], _abr_range[1]),
     }
 
     for metric in metrics:

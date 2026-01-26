@@ -1,0 +1,45 @@
+# Synthetic Generator Configuration (Backend-Agnostic Framework)
+# Per plan Part A: Realistic synthetic data with 50 features
+
+sizes:
+  n_population: 200000     # Total population pool
+  n_holdout: 20000         # Representative holdout size
+  n_accepts_target: 40000  # Target number of accepts
+  # n_rejects will be ~140000 (remaining pool)
+
+features:
+  n_continuous: 30         # Skewed + bounded ratio features
+  n_count: 10              # Count/integer features
+  n_binary: 5              # Binary features
+  n_categorical: 5         # Categorical (4-8 levels)
+  total: 50                # Must equal sum of above
+
+labels:
+  population_bad_rate: 0.10    # 8-12% range, using 10%
+  # accepts_bad_rate should be < holdout_bad_rate after selection
+
+acceptance_loop:
+  n_periods: 500               # T = 500 iterations
+  batch_size: 80               # q = ceil(N_accepts_target / T)
+  sigma_policy: 0.25           # Stochastic noise in [0.15, 0.35]
+  acceptance_mode: "stochastic_topk"  # or "topk"
+  initial_seed_size: 2000      # Da0 via noisy policy
+
+  snapshot_iterations:         # Record snapshots at these iterations
+    - 1
+    - 5
+    - 10
+    - 50
+    - 100
+    - 250
+    - 500
+
+xgboost:
+  max_depth: 3
+  n_estimators: 200
+  learning_rate: 0.07          # Mid-range of 0.05-0.1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  tree_method: "hist"
+
+random_seed: 42

@@ -19,11 +19,12 @@ Key parameters from Table E.9:
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, Optional
 
 import numpy as np
 
 from src.evaluation.metrics import compute_metrics
+from src.evaluation.thresholds import ThresholdSpec
 
 if TYPE_CHECKING:
     from src.config import BayesianEvalConfig
@@ -106,6 +107,7 @@ def bayesian_evaluate(
     cfg: BayesianEvalConfig,
     metrics_list: list[str] | None = None,
     prior_scores_rejects: np.ndarray | None = None,
+    threshold_spec: Optional[ThresholdSpec] = None,
 ) -> dict[str, Any]:
     """Bayesian evaluation with MC convergence (Algorithm 1).
 
@@ -130,6 +132,8 @@ def bayesian_evaluate(
         metrics_list: Metrics to compute. Default: ["auc", "pauc", "brier", "abr"].
         prior_scores_rejects: f_prior's scores for rejects (used for pseudo-labeling).
             If None, uses scores_rejects (backward compatible, but not paper-faithful).
+        threshold_spec: ThresholdSpec for ABR/pAUC thresholds. If provided, takes
+            precedence over cfg.abr_range. If None, falls back to cfg.abr_range.
 
     Returns:
         Dictionary with posterior statistics for each metric:
@@ -150,7 +154,10 @@ def bayesian_evaluate(
 
     # Handle edge case: no rejects
     if n_rejects == 0:
-        base_metrics = compute_metrics(y_accepts, scores_accepts, metrics_list, cfg.abr_range)
+        base_metrics = compute_metrics(
+            y_accepts, scores_accepts, metrics_list,
+            threshold_spec=threshold_spec, abr_range=cfg.abr_range
+        )
         return {
             metric: {"mean": val, "std": 0.0, "q2.5": val, "q97.5": val}
             for metric, val in base_metrics.items()
@@ -197,7 +204,10 @@ def bayesian_evaluate(
         scores_combined = all_scores
 
         # Compute metrics for this MC sample
-        sample_metrics = compute_metrics(y_combined, scores_combined, metrics_list, cfg.abr_range)
+        sample_metrics = compute_metrics(
+            y_combined, scores_combined, metrics_list,
+            threshold_spec=threshold_spec, abr_range=cfg.abr_range
+        )
 
         # Store samples and update running means
         prev_means = running_means.copy()
