@@ -25,11 +25,7 @@ jupyter notebook notebooks/figure_2.ipynb
 Generate realistic synthetic credit data with 50 features and run the acceptance loop simulation.
 
 ```bash
-# Generate data bundle (creates data/synthetic/<run_id>/)
-python scripts/generate_synthetic_like_real.py
-
-# Or with custom config/seed
-python scripts/generate_synthetic_like_real.py --config configs/synthetic_generator.yaml --seed 42
+python scripts/generate_synthetic_like_real.py --config configs/synthetic_generator.yaml
 ```
 
 **Output structure:**
@@ -44,42 +40,173 @@ data/synthetic/<run_id>/
 
 ### Step 2: Run Experiment I (Table 2 - Evaluation Accuracy)
 
-Compares biased vs Bayesian evaluation methods across 100 replicates.
+Compares biased vs Bayesian evaluation methods across 100 replicates (4 folds × 25 bootstraps).
 
 ```bash
-# Full run (4 folds × 25 bootstraps = 100 replicates)
 python scripts/run_experiment_1.py --data-dir data/synthetic/<run_id>
-
-# Quick test (fewer replicates)
-python scripts/run_experiment_1.py --data-dir data/synthetic/<run_id> --n-folds 2 --n-bootstraps 2
 ```
 
 **Output:** `experiments/exp1_<timestamp>/exp1_results.csv`
 
 ### Step 3: Run Experiment II (Table 3 - Training Comparison)
 
-Compares accepts-only vs BASL training methods across 100 replicates.
+Compares accepts-only vs BASL training methods across 100 replicates (4 folds × 25 bootstraps).
 
 ```bash
-# Full run (4 folds × 25 bootstraps = 100 replicates)
 python scripts/run_experiment_2.py --data-dir data/synthetic/<run_id>
-
-# Quick test (fewer replicates)
-python scripts/run_experiment_2.py --data-dir data/synthetic/<run_id> --n-folds 2 --n-bootstraps 2
 ```
 
 **Output:** `experiments/exp2_<timestamp>/exp2_results.csv`
 
-### Step 4: Verify Results
+### Step 4: Verify & Analyze
 
 ```bash
+# Verify results
 python scripts/verify_experiments.py
+
+# Generate Tables 2 & 3
+jupyter notebook notebooks/table2_table3.ipynb
 ```
 
-### Step 5: Generate Tables
+---
+
+## Customizing Synthetic Data
+
+Modify `configs/synthetic_generator.yaml` to customize data generation.
+
+### Feature Customization
+
+```yaml
+features:
+  n_continuous: 60    # Skewed + bounded ratio features (default: 30)
+  n_count: 20         # Count/integer features (default: 10)
+  n_binary: 10        # Binary features (default: 5)
+  n_categorical: 10   # Categorical with 4-8 levels (default: 5)
+  total: 100          # Must equal sum of above
+```
+
+### Size Customization
+
+```yaml
+sizes:
+  n_population: 200000     # Total population pool
+  n_holdout: 20000         # Representative holdout size
+  n_accepts_target: 40000  # Target number of accepts
+  # n_rejects will be remaining pool (~140000)
+```
+
+### Acceptance Loop Customization
+
+```yaml
+acceptance_loop:
+  n_periods: 500           # T = number of iterations
+  batch_size: 80           # Applicants accepted per period
+  sigma_policy: 0.25       # Stochastic noise in [0.15, 0.35]
+  acceptance_mode: "stochastic_topk"  # or "topk"
+  initial_seed_size: 2000  # Da0 via noisy policy
+```
+
+### XGBoost Hyperparameters
+
+```yaml
+xgboost:
+  max_depth: 3
+  n_estimators: 200
+  learning_rate: 0.07
+  subsample: 0.8
+  colsample_bytree: 0.8
+```
+
+---
+
+## Using Your Own Data
+
+You can use your own credit data by providing CSV files in the expected format.
+
+### Required Files
+
+```
+data/your_dataset/
+├── Da.csv    # Accepts (with y column, binary 0/1)
+├── Dr.csv    # Rejects (NO y column)
+└── H.csv     # Holdout (with y column, binary 0/1)
+```
+
+### Format Requirements
+
+| File | y column | Description |
+|------|----------|-------------|
+| `Da.csv` | Required | Accepted applicants with observed outcomes |
+| `Dr.csv` | Not present | Rejected applicants (labels unknown) |
+| `H.csv` | Required | Representative holdout for evaluation |
+
+**Important:**
+- All files must have identical feature columns (excluding `y`)
+- The `y` column must be binary: 0 = good (non-default), 1 = bad (default)
+- `Dr.csv` must NOT have a `y` column (labels are unknown for rejects)
+- Sanity check: `bad_rate(Da) < bad_rate(H)` (accepts should have lower bad rate than population)
+
+### Usage
 
 ```bash
-jupyter notebook notebooks/table2_table3.ipynb
+python scripts/run_experiment_1.py --data-dir data/your_dataset
+python scripts/run_experiment_2.py --data-dir data/your_dataset
+```
+
+---
+
+## Using Your Own Model
+
+You can integrate custom models by implementing the required interface.
+
+### Required Interface
+
+```python
+class MyModel:
+    def __init__(self, cfg):
+        """Initialize model with configuration object."""
+        ...
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Train the model on labeled data.
+
+        Args:
+            X: Feature matrix of shape (n_samples, n_features).
+            y: Binary labels of shape (n_samples,), where 1=bad, 0=good.
+        """
+        ...
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Return probability of default (P(y=1)) for each sample.
+
+        Args:
+            X: Feature matrix of shape (n_samples, n_features).
+
+        Returns:
+            1D array of shape (n_samples,) with P(y=1|X) estimates.
+        """
+        ...
+```
+
+### Example: Sklearn Wrapper
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+import numpy as np
+
+class RandomForestModel:
+    def __init__(self, cfg):
+        self._model = RandomForestClassifier(
+            n_estimators=cfg.n_estimators,
+            max_depth=cfg.max_depth,
+            random_state=cfg.random_seed,
+        )
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        self._model.fit(X, y)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        return self._model.predict_proba(X)[:, 1]
 ```
 
 ---
